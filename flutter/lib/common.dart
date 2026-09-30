@@ -238,11 +238,11 @@ class ColorThemeExtension extends ThemeExtension<ColorThemeExtension> {
       highlight: Color.lerp(highlight, other.highlight, t),
       drag_indicator: Color.lerp(drag_indicator, other.drag_indicator, t),
       shadow: Color.lerp(shadow, other.shadow, t),
-      errorBannerBg: Color.lerp(shadow, other.errorBannerBg, t),
-      me: Color.lerp(shadow, other.me, t),
-      toastBg: Color.lerp(shadow, other.toastBg, t),
-      toastText: Color.lerp(shadow, other.toastText, t),
-      divider: Color.lerp(shadow, other.divider, t),
+      errorBannerBg: Color.lerp(errorBannerBg, other.errorBannerBg, t),
+      me: Color.lerp(me, other.me, t),
+      toastBg: Color.lerp(toastBg, other.toastBg, t),
+      toastText: Color.lerp(toastText, other.toastText, t),
+      divider: Color.lerp(divider, other.divider, t),
     );
   }
 }
@@ -2951,19 +2951,34 @@ class ServerConfig {
   /// also see [encode]
   /// throw when decoding failure
   ServerConfig.decode(String msg) {
-    var json = {};
+    dynamic decoded;
     try {
-      // back compatible
-      json = jsonDecode(msg);
-    } catch (err) {
+      // Backward compatible with the plain JSON form.
+      decoded = jsonDecode(msg);
+    } catch (_) {
       final input = msg.split('').reversed.join('');
       final bytes = base64Decode(base64.normalize(input));
-      json = jsonDecode(utf8.decode(bytes, allowMalformed: true));
+      // Reject corrupted UTF-8 instead of silently replacing bytes. This keeps
+      // invalid QR/config data from opening a partially populated dialog.
+      decoded = jsonDecode(utf8.decode(bytes, allowMalformed: false));
     }
-    idServer = json['host'] ?? '';
-    relayServer = json['relay'] ?? '';
-    apiServer = json['api'] ?? '';
-    key = json['key'] ?? '';
+    if (decoded is! Map<String, dynamic>) {
+      throw const FormatException('Server config must be a JSON object');
+    }
+
+    String readString(String name) {
+      final value = decoded[name];
+      if (value == null) return '';
+      if (value is! String) {
+        throw FormatException('Server config field "$name" must be a string');
+      }
+      return value.trim();
+    }
+
+    idServer = readString('host');
+    relayServer = readString('relay');
+    apiServer = readString('api');
+    key = readString('key');
   }
 
   /// encode to shared string
@@ -2974,7 +2989,7 @@ class ServerConfig {
     config['relay'] = relayServer.trim();
     config['api'] = apiServer.trim();
     config['key'] = key.trim();
-    return base64UrlEncode(Uint8List.fromList(jsonEncode(config).codeUnits))
+    return base64UrlEncode(utf8.encode(jsonEncode(config)))
         .split('')
         .reversed
         .join();
