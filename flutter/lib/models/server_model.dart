@@ -166,7 +166,7 @@ class ServerModel with ChangeNotifier {
           final res = await bind.cmCheckClientsLength(length: _clients.length);
           if (res != null) {
             debugPrint("clients not match!");
-            updateClientState(res);
+            await updateClientState(res);
           } else {
             if (_clients.isEmpty) {
               hideCmWindow();
@@ -183,7 +183,7 @@ class ServerModel with ChangeNotifier {
 
         await updatePasswordModel();
       } catch (error, stackTrace) {
-        debugPrint("Server status poll failed: $error\\n$stackTrace");
+        debugPrint("Server status poll failed: $error\n$stackTrace");
       } finally {
         _timerCallbackRunning = false;
       }
