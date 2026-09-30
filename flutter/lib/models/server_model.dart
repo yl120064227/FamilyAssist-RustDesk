@@ -218,6 +218,7 @@ class ServerModel with ChangeNotifier {
     _serverTimer = null;
     cmHiddenTimer?.cancel();
     cmHiddenTimer = null;
+    WakelockManager.disable(_wakelockKey);
     controller.dispose();
     _serverPasswd.dispose();
     _serverId.dispose();
