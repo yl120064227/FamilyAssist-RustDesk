@@ -2951,19 +2951,34 @@ class ServerConfig {
   /// also see [encode]
   /// throw when decoding failure
   ServerConfig.decode(String msg) {
-    var json = {};
+    dynamic decoded;
     try {
-      // back compatible
-      json = jsonDecode(msg);
-    } catch (err) {
+      // Backward compatible with the plain JSON form.
+      decoded = jsonDecode(msg);
+    } catch (_) {
       final input = msg.split('').reversed.join('');
       final bytes = base64Decode(base64.normalize(input));
-      json = jsonDecode(utf8.decode(bytes, allowMalformed: true));
+      // Reject corrupted UTF-8 instead of silently replacing bytes. This keeps
+      // invalid QR/config data from opening a partially populated dialog.
+      decoded = jsonDecode(utf8.decode(bytes));
     }
-    idServer = json['host'] ?? '';
-    relayServer = json['relay'] ?? '';
-    apiServer = json['api'] ?? '';
-    key = json['key'] ?? '';
+    if (decoded is! Map<String, dynamic>) {
+      throw const FormatException('Server config must be a JSON object');
+    }
+
+    String readString(String name) {
+      final value = decoded[name];
+      if (value == null) return '';
+      if (value is! String) {
+        throw FormatException('Server config field "$name" must be a string');
+      }
+      return value.trim();
+    }
+
+    idServer = readString('host');
+    relayServer = readString('relay');
+    apiServer = readString('api');
+    key = readString('key');
   }
 
   /// encode to shared string
