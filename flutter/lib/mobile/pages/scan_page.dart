@@ -159,9 +159,9 @@ class _ScanPageState extends State<ScanPage> {
       await controller?.pauseCamera();
       if (!mounted) return;
       closeConnection();
-      Timer(Duration(milliseconds: 60), () {
-        showServerSettingsWithValue(sc, gFFI.dialogManager, null);
-      });
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      if (!mounted) return;
+      showServerSettingsWithValue(sc, gFFI.dialogManager, null);
     } catch (e) {
       _handlingConfig = false;
       showToast('Invalid QR code');
