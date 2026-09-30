@@ -156,6 +156,7 @@ class ServerModel with ChangeNotifier {
       try {
         final connectionStatus = jsonDecode(
                 await bind.mainGetConnectStatus()) as Map<String, dynamic>;
+        if (_disposed) return;
         final statusNum = connectionStatus['status_num'] as int;
         if (statusNum != _connectStatus) {
           _connectStatus = statusNum;
@@ -164,6 +165,7 @@ class ServerModel with ChangeNotifier {
 
         if (desktopType == DesktopType.cm) {
           final res = await bind.cmCheckClientsLength(length: _clients.length);
+          if (_disposed) return;
           if (res != null) {
             debugPrint("clients not match!");
             await updateClientState(res);
@@ -181,9 +183,13 @@ class ServerModel with ChangeNotifier {
           }
         }
 
-        await updatePasswordModel();
+        if (!_disposed) {
+          await updatePasswordModel();
+        }
       } catch (error, stackTrace) {
-        debugPrint("Server status poll failed: $error\n$stackTrace");
+        if (!_disposed) {
+          debugPrint("Server status poll failed: $error\n$stackTrace");
+        }
       } finally {
         _timerCallbackRunning = false;
       }
@@ -251,15 +257,21 @@ class ServerModel with ChangeNotifier {
   }
 
   updatePasswordModel() async {
+    if (_disposed) return;
     var update = false;
     final temporaryPassword = await bind.mainGetTemporaryPassword();
+    if (_disposed) return;
     final verificationMethod =
         await bind.mainGetOption(key: kOptionVerificationMethod);
+    if (_disposed) return;
     final temporaryPasswordLength =
         await bind.mainGetOption(key: "temporary-password-length");
+    if (_disposed) return;
     final approveMode = await bind.mainGetOption(key: kOptionApproveMode);
+    if (_disposed) return;
     final numericOneTimePassword =
         await mainGetBoolOption(kOptionAllowNumericOneTimePassword);
+    if (_disposed) return;
     /*
     var hideCm = option2bool(
         'allow-hide-cm', await bind.mainGetOption(key: 'allow-hide-cm'));
@@ -315,7 +327,7 @@ class ServerModel with ChangeNotifier {
       update = true;
     }
     */
-    if (update) {
+    if (update && !_disposed) {
       notifyListeners();
     }
   }
