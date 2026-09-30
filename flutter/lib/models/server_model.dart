@@ -49,6 +49,9 @@ class ServerModel with ChangeNotifier {
   final List<Client> _clients = [];
 
   Timer? cmHiddenTimer;
+  Timer? _serverTimer;
+  bool _timerCallbackRunning = false;
+  bool _disposed = false;
 
   final _wakelockKey = UniqueKey();
 
@@ -147,45 +150,52 @@ class ServerModel with ChangeNotifier {
     }
     */
 
-    timerCallback() async {
-      final connectionStatus =
-          jsonDecode(await bind.mainGetConnectStatus()) as Map<String, dynamic>;
-      final statusNum = connectionStatus['status_num'] as int;
-      if (statusNum != _connectStatus) {
-        _connectStatus = statusNum;
-        notifyListeners();
-      }
+    Future<void> timerCallback() async {
+      if (_disposed || _timerCallbackRunning) return;
+      _timerCallbackRunning = true;
+      try {
+        final connectionStatus = jsonDecode(
+                await bind.mainGetConnectStatus()) as Map<String, dynamic>;
+        final statusNum = connectionStatus['status_num'] as int;
+        if (statusNum != _connectStatus) {
+          _connectStatus = statusNum;
+          notifyListeners();
+        }
 
-      if (desktopType == DesktopType.cm) {
-        final res = await bind.cmCheckClientsLength(length: _clients.length);
-        if (res != null) {
-          debugPrint("clients not match!");
-          updateClientState(res);
-        } else {
-          if (_clients.isEmpty) {
-            hideCmWindow();
-            if (_zeroClientLengthCounter++ == 12) {
-              // 6 second
-              windowManager.close();
-            }
+        if (desktopType == DesktopType.cm) {
+          final res = await bind.cmCheckClientsLength(length: _clients.length);
+          if (res != null) {
+            debugPrint("clients not match!");
+            updateClientState(res);
           } else {
-            _zeroClientLengthCounter = 0;
-            if (!hideCm) showCmWindow();
+            if (_clients.isEmpty) {
+              hideCmWindow();
+              if (_zeroClientLengthCounter++ == 12) {
+                // 6 seconds
+                await windowManager.close();
+              }
+            } else {
+              _zeroClientLengthCounter = 0;
+              if (!hideCm) showCmWindow();
+            }
           }
         }
+
+        await updatePasswordModel();
+      } catch (error, stackTrace) {
+        debugPrint("Server status poll failed: $error\\n$stackTrace");
+      } finally {
+        _timerCallbackRunning = false;
       }
-
-      updatePasswordModel();
     }
-
     if (!isTest) {
       Future.delayed(Duration.zero, () async {
         if (await bind.optionSynced()) {
           await timerCallback();
         }
       });
-      Timer.periodic(Duration(milliseconds: 500), (timer) async {
-        await timerCallback();
+      _serverTimer = Timer.periodic(Duration(milliseconds: 500), (_) {
+        timerCallback();
       });
     }
 
@@ -193,6 +203,19 @@ class ServerModel with ChangeNotifier {
     if (isMobile) {
       bind.mainSetOption(key: kOptionEnableKeyboard, value: 'N');
     }
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _serverTimer?.cancel();
+    _serverTimer = null;
+    cmHiddenTimer?.cancel();
+    cmHiddenTimer = null;
+    controller.dispose();
+    _serverPasswd.dispose();
+    _serverId.dispose();
+    super.dispose();
   }
 
   /// 1. check android permission
@@ -793,7 +816,7 @@ class ServerModel with ChangeNotifier {
             bind.mainGetLocalOption(key: kOptionKeepScreenOn));
     final on = ((keepScreenOn == KeepScreenOn.serviceOn) && _isStart) ||
         (keepScreenOn == KeepScreenOn.duringControlled &&
-            _clients.map((e) => !e.disconnected).isNotEmpty);
+            _clients.any((e) => !e.disconnected));
     if (on) {
       WakelockManager.enable(_wakelockKey, isServer: true);
     } else {
