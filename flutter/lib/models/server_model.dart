@@ -540,8 +540,9 @@ class ServerModel with ChangeNotifier {
 
   // force
   updateClientState([String? json]) async {
-    if (isTest) return;
-    var res = await bind.cmGetClientsState();
+    if (isTest || _disposed) return;
+    final res = json ?? await bind.cmGetClientsState();
+    if (_disposed) return;
     List<dynamic> clientsJson;
     try {
       clientsJson = jsonDecode(res);
