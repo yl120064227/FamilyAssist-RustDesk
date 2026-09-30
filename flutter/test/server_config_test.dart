@@ -53,4 +53,15 @@ void main() {
     expect(config.apiServer, isEmpty);
     expect(config.key, isEmpty);
   });
+
+  test('server config rejects malformed UTF-8 payloads', () {
+    final malformed = base64UrlEncode(<int>[0xff, 0xfe])
+        .split('').reversed.join();
+    expect(() => ServerConfig.decode(malformed), throwsFormatException);
+  });
+
+  test('server config rejects non-string fields', () {
+    final json = jsonEncode({'host': 123});
+    expect(() => ServerConfig.decode(json), throwsFormatException);
+  });
 }
