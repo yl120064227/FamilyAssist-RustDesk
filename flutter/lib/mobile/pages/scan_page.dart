@@ -160,7 +160,9 @@ class _ScanPageState extends State<ScanPage> {
       if (!mounted) return;
       closeConnection();
       await Future<void>.delayed(const Duration(milliseconds: 60));
-      if (!mounted) return;
+      // closeConnection() intentionally navigates away from this page. The
+      // dialog manager belongs to the app shell, so it remains valid after
+      // the scanner is popped.
       showServerSettingsWithValue(sc, gFFI.dialogManager, null);
     } catch (e) {
       _handlingConfig = false;
