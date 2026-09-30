@@ -2960,7 +2960,7 @@ class ServerConfig {
       final bytes = base64Decode(base64.normalize(input));
       // Reject corrupted UTF-8 instead of silently replacing bytes. This keeps
       // invalid QR/config data from opening a partially populated dialog.
-      decoded = jsonDecode(utf8.decode(bytes));
+      decoded = jsonDecode(utf8.decode(bytes, allowMalformed: false));
     }
     if (decoded is! Map<String, dynamic>) {
       throw const FormatException('Server config must be a JSON object');
