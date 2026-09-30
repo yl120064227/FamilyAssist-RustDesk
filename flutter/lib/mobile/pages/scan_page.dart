@@ -20,6 +20,7 @@ class _ScanPageState extends State<ScanPage> {
   QRViewController? controller;
   final GlobalKey qrKey = GlobalKey(debugLabel: 'QR');
   StreamSubscription? scanSubscription;
+  bool _handlingConfig = false;
 
   @override
   void reassemble() {
@@ -147,18 +148,22 @@ class _ScanPageState extends State<ScanPage> {
   }
 
   void showServerSettingFromQr(String data) async {
-    closeConnection();
-    await controller?.pauseCamera();
+    if (_handlingConfig || !mounted) return;
     if (!data.startsWith('config=')) {
       showToast('Invalid QR code');
       return;
     }
     try {
       final sc = ServerConfig.decode(data.substring(7));
+      _handlingConfig = true;
+      await controller?.pauseCamera();
+      if (!mounted) return;
+      closeConnection();
       Timer(Duration(milliseconds: 60), () {
         showServerSettingsWithValue(sc, gFFI.dialogManager, null);
       });
     } catch (e) {
+      _handlingConfig = false;
       showToast('Invalid QR code');
     }
   }

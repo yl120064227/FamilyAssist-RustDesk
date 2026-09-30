@@ -6,6 +6,7 @@ import subprocess
 from hashlib import md5
 import brotli
 import datetime
+from pathlib import Path
 
 # 4GB maximum
 length_count = 4
@@ -17,23 +18,41 @@ encoding = 'utf-8'
 
 def generate_md5_table(folder: str, level) -> dict:
     res: dict = dict()
-    curdir = os.curdir
-    os.chdir(folder)
-    for root, _, files in os.walk('.'):
-        # remove ./
-        for f in files:
-            md5_generator = md5()
-            full_path = os.path.join(root, f)
+    if not os.path.isdir(folder):
+        raise NotADirectoryError(folder)
+    for root, dirs, files in os.walk(folder):
+        dirs.sort()
+        for name in sorted(files):
+            full_path = os.path.join(root, name)
             print(f"Processing {full_path}...")
-            f = open(full_path, "rb")
-            content = f.read()
+            with open(full_path, "rb") as f:
+                content = f.read()
             content_compressed = brotli.compress(
                 content, quality=level)
-            md5_generator.update(content)
-            md5_code = md5_generator.hexdigest().encode(encoding=encoding)
-            res[full_path] = (content_compressed, md5_code)
-    os.chdir(curdir)
+            md5_code = md5(content).hexdigest().encode(encoding=encoding)
+            package_path = os.path.join('.', os.path.relpath(full_path, folder))
+            res[package_path] = (content_compressed, md5_code)
     return res
+
+
+def resolve_executable(folder: str, executable: str) -> str:
+    folder_path = Path(folder).resolve()
+    executable_path = Path(executable)
+    if not executable_path.is_absolute():
+        cwd_path = executable_path.resolve()
+        try:
+            cwd_path.relative_to(folder_path)
+            executable_path = cwd_path
+        except ValueError:
+            executable_path = folder_path / executable_path
+    executable_path = executable_path.resolve()
+    try:
+        relative_path = executable_path.relative_to(folder_path)
+    except ValueError:
+        raise ValueError("The executable must be inside the source folder") from None
+    if not executable_path.is_file():
+        raise ValueError("The executable must be an existing file")
+    return os.path.join('.', str(relative_path))
 
 
 def write_package_metadata(md5_table: dict, output_folder: str, exe: str):
@@ -96,15 +115,10 @@ if __name__ == '__main__':
     folder = options.folder or './rustdesk'
     output_folder = os.path.abspath(options.output_folder or './')
 
-    if not options.executable:
-        options.executable = 'rustdesk.exe'
-    if not options.executable.startswith(folder):
-        options.executable = folder + '/' + options.executable
-    exe: str = os.path.abspath(options.executable)
-    if not exe.startswith(os.path.abspath(folder)):
-        print("The executable must locate in source folder")
-        exit(-1)
-    exe = '.' + exe[len(os.path.abspath(folder)):]
+    try:
+        exe = resolve_executable(folder, options.executable or 'rustdesk.exe')
+    except ValueError as error:
+        parser.error(str(error))
     print("Executable path: " + exe)
     print("Compression level: " + str(options.level))
     md5_table = generate_md5_table(folder, options.level)
