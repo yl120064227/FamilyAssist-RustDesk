@@ -336,9 +336,10 @@ class ServerModel with ChangeNotifier {
     }
   }
 
-  toggleAudio() async {
+  Future<void> toggleAudio() async {
     if (clients.any((c) => !c.disconnected)) {
       await showClientsMayNotBeChangedAlert(parent.target);
+      return;
     }
     if (!_audioOk && !await AndroidPermissionManager.check(kRecordAudio)) {
       final res = await AndroidPermissionManager.request(kRecordAudio);
@@ -354,9 +355,10 @@ class ServerModel with ChangeNotifier {
     notifyListeners();
   }
 
-  toggleFile() async {
+  Future<void> toggleFile() async {
     if (clients.any((c) => !c.disconnected)) {
       await showClientsMayNotBeChangedAlert(parent.target);
+      return;
     }
     if (!_fileOk &&
         !await AndroidPermissionManager.check(kManageExternalStorage)) {
@@ -383,9 +385,10 @@ class ServerModel with ChangeNotifier {
     notifyListeners();
   }
 
-  toggleInput() async {
+  Future<void> toggleInput() async {
     if (clients.any((c) => !c.disconnected)) {
       await showClientsMayNotBeChangedAlert(parent.target);
+      return;
     }
     if (_inputOk) {
       parent.target?.invokeMethod("stop_input");
@@ -450,7 +453,7 @@ class ServerModel with ChangeNotifier {
         );
       });
       if (res == true) {
-        stopService();
+        await stopService();
       }
     } else {
       await checkRequestNotificationPermission();
@@ -480,34 +483,60 @@ class ServerModel with ChangeNotifier {
         );
       });
       if (res == true) {
-        startService();
+        await startService();
       }
     }
   }
 
   /// Start the screen sharing service.
   Future<void> startService() async {
+    if (_disposed || _isStart) return;
+
     _isStart = true;
     notifyListeners();
-    parent.target?.ffiModel.updateEventListener(parent.target!.sessionId, "");
-    await parent.target?.invokeMethod("init_service");
-    // ugly is here, because for desktop, below is useless
-    await bind.mainStartService();
-    updateClientState();
-    if (isAndroid) {
-      androidUpdatekeepScreenOn();
+    try {
+      parent.target?.ffiModel.updateEventListener(parent.target!.sessionId, "");
+      await parent.target?.invokeMethod("init_service");
+      // ugly is here, because for desktop, below is useless
+      await bind.mainStartService();
+      await updateClientState();
+      if (isAndroid) {
+        androidUpdatekeepScreenOn();
+      }
+    } catch (error, stackTrace) {
+      debugPrint("Failed to start service: $error\n$stackTrace");
+      _isStart = false;
+      try {
+        await parent.target?.invokeMethod("stop_service");
+        await bind.mainStopService();
+      } catch (rollbackError, rollbackStackTrace) {
+        debugPrint(
+            "Failed to roll back service start: $rollbackError\n$rollbackStackTrace");
+      }
+      if (!_disposed) {
+        notifyListeners();
+        showToast(translate('Failed'));
+      }
     }
   }
 
   /// Stop the screen sharing service.
   Future<void> stopService() async {
+    if (_disposed) return;
     _isStart = false;
-    closeAll();
-    await parent.target?.invokeMethod("stop_service");
-    await bind.mainStopService();
-    notifyListeners();
-    // for androidUpdatekeepScreenOn only
-    WakelockManager.disable(_wakelockKey);
+    try {
+      await closeAll();
+      await parent.target?.invokeMethod("stop_service");
+      await bind.mainStopService();
+    } catch (error, stackTrace) {
+      debugPrint("Failed to stop service: $error\n$stackTrace");
+    } finally {
+      if (!_disposed) {
+        notifyListeners();
+        // for androidUpdatekeepScreenOn only
+        WakelockManager.disable(_wakelockKey);
+      }
+    }
   }
 
   fetchID() async {
@@ -574,9 +603,13 @@ class ServerModel with ChangeNotifier {
         showCmWindow();
       }
     }
-    if (_clients.length != oldClientLenght) {
+    if (!_disposed) {
+      // The list length can stay the same while a connection changes state.
+      // Refresh listeners after rebuilding the complete client snapshot.
       notifyListeners();
-      if (isAndroid) androidUpdatekeepScreenOn();
+      if (_clients.length != oldClientLenght && isAndroid) {
+        androidUpdatekeepScreenOn();
+      }
     }
   }
 
@@ -741,9 +774,14 @@ class ServerModel with ChangeNotifier {
     });
   }
 
-  void sendLoginResponse(Client client, bool res) async {
+  Future<void> sendLoginResponse(Client client, bool res) async {
     if (_disposed) return;
-    bind.cmLoginRes(connId: client.id, res: res);
+    try {
+      await bind.cmLoginRes(connId: client.id, res: res);
+    } catch (error, stackTrace) {
+      debugPrint("Failed to answer login request: $error\n$stackTrace");
+      return;
+    }
     parent.target?.invokeMethod("cancel_notification", client.id);
     if (res) {
       if (!client.isFileTransfer && !client.isTerminal) {
@@ -874,6 +912,16 @@ enum ClientType {
 }
 
 class Client {
+  static int _intValue(dynamic value) {
+    if (value is int) return value;
+    if (value is num) return value.toInt();
+    return int.tryParse(value?.toString() ?? '') ?? 0;
+  }
+
+  static bool _boolValue(dynamic value) => value == true;
+
+  static String _stringValue(dynamic value) => value?.toString() ?? '';
+
   int id = 0; // client connections inner count id
   bool authorized = false;
   bool isFileTransfer = false;
@@ -902,28 +950,30 @@ class Client {
       this.name, this.peerId, this.keyboard, this.clipboard, this.audio);
 
   Client.fromJson(Map<String, dynamic> json) {
-    id = json['id'];
-    authorized = json['authorized'];
-    isFileTransfer = json['is_file_transfer'];
-    // TODO: no entry then default.
-    isViewCamera = json['is_view_camera'];
-    isTerminal = json['is_terminal'] ?? false;
-    portForward = json['port_forward'];
-    name = json['name'];
-    avatar = json['avatar'] ?? '';
-    peerId = json['peer_id'];
-    keyboard = json['keyboard'];
-    clipboard = json['clipboard'];
-    audio = json['audio'];
-    file = json['file'];
-    restart = json['restart'];
-    recording = json['recording'];
-    blockInput = json['block_input'];
-    privacyMode = json['privacy_mode'] ?? privacyMode;
-    disconnected = json['disconnected'];
-    fromSwitch = json['from_switch'];
-    inVoiceCall = json['in_voice_call'];
-    incomingVoiceCall = json['incoming_voice_call'];
+    // Connection events are produced by different native versions. Treat
+    // missing or differently typed optional fields as defaults instead of
+    // dropping the whole event because of a cast exception.
+    id = _intValue(json['id']);
+    authorized = _boolValue(json['authorized']);
+    isFileTransfer = _boolValue(json['is_file_transfer']);
+    isViewCamera = _boolValue(json['is_view_camera']);
+    isTerminal = _boolValue(json['is_terminal']);
+    portForward = _stringValue(json['port_forward']);
+    name = _stringValue(json['name']);
+    avatar = _stringValue(json['avatar']);
+    peerId = _stringValue(json['peer_id']);
+    keyboard = _boolValue(json['keyboard']);
+    clipboard = _boolValue(json['clipboard']);
+    audio = _boolValue(json['audio']);
+    file = _boolValue(json['file']);
+    restart = _boolValue(json['restart']);
+    recording = _boolValue(json['recording']);
+    blockInput = _boolValue(json['block_input']);
+    privacyMode = _boolValue(json['privacy_mode']);
+    disconnected = _boolValue(json['disconnected']);
+    fromSwitch = _boolValue(json['from_switch']);
+    inVoiceCall = _boolValue(json['in_voice_call']);
+    incomingVoiceCall = _boolValue(json['incoming_voice_call']);
   }
 
   Map<String, dynamic> toJson() {
