@@ -508,6 +508,7 @@ class ServerModel with ChangeNotifier {
       _isStart = false;
       try {
         await parent.target?.invokeMethod("stop_service");
+        await bind.mainStopService();
       } catch (rollbackError, rollbackStackTrace) {
         debugPrint(
             "Failed to roll back service start: $rollbackError\n$rollbackStackTrace");
