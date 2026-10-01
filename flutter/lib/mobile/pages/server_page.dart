@@ -189,6 +189,7 @@ class _ServerPageState extends State<ServerPage> {
       await gFFI.serverModel.fetchID();
     });
     gFFI.serverModel.checkAndroidPermission();
+    unawaited(checkService());
   }
 
   @override
@@ -199,7 +200,6 @@ class _ServerPageState extends State<ServerPage> {
 
   @override
   Widget build(BuildContext context) {
-    checkService();
     return ChangeNotifierProvider.value(
         value: gFFI.serverModel,
         child: Consumer<ServerModel>(
@@ -223,13 +223,17 @@ class _ServerPageState extends State<ServerPage> {
   }
 }
 
-void checkService() async {
-  gFFI.invokeMethod("check_service");
+Future<void> checkService() async {
+  try {
+    await gFFI.invokeMethod("check_service");
+  } catch (error, stackTrace) {
+    debugPrint("Failed to check Android service state: $error\n$stackTrace");
+  }
   // for Android 10/11, request MANAGE_EXTERNAL_STORAGE permission from system setting page
   if (AndroidPermissionManager.isWaitingFile() && !gFFI.serverModel.fileOk) {
-    AndroidPermissionManager.complete(kManageExternalStorage,
-        await AndroidPermissionManager.check(kManageExternalStorage));
-    debugPrint("file permission finished");
+    final granted = await AndroidPermissionManager.check(kManageExternalStorage);
+    AndroidPermissionManager.complete(kManageExternalStorage, granted);
+    debugPrint("file permission finished: $granted");
   }
 }
 
