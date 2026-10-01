@@ -52,6 +52,9 @@ class ServerModel with ChangeNotifier {
   Timer? _serverTimer;
   bool _timerCallbackRunning = false;
   bool _disposed = false;
+  // Incremented whenever a service transition starts. An older async start
+  // must not finish after a newer stop (or restart) request.
+  int _serviceOperation = 0;
   int _keepScreenOnGeneration = 0;
 
   final _wakelockKey = UniqueKey();
@@ -502,27 +505,38 @@ class ServerModel with ChangeNotifier {
   Future<void> startService() async {
     if (_disposed || _isStart) return;
 
+    final operation = ++_serviceOperation;
     _isStart = true;
     notifyListeners();
     try {
       parent.target?.ffiModel.updateEventListener(parent.target!.sessionId, "");
       await parent.target?.invokeMethod("init_service");
+      if (_disposed || operation != _serviceOperation || !_isStart) {
+        await _rollbackServiceStart(operation);
+        return;
+      }
       // ugly is here, because for desktop, below is useless
       await bind.mainStartService();
+      if (_disposed || operation != _serviceOperation || !_isStart) {
+        await _rollbackServiceStart(operation);
+        return;
+      }
       await updateClientState();
+      if (_disposed || operation != _serviceOperation || !_isStart) {
+        await _rollbackServiceStart(operation);
+        return;
+      }
       if (isAndroid) {
         androidUpdatekeepScreenOn();
       }
     } catch (error, stackTrace) {
       debugPrint("Failed to start service: $error\n$stackTrace");
-      _isStart = false;
-      try {
-        await parent.target?.invokeMethod("stop_service");
-        await bind.mainStopService();
-      } catch (rollbackError, rollbackStackTrace) {
-        debugPrint(
-            "Failed to roll back service start: $rollbackError\n$rollbackStackTrace");
+      final superseded = operation != _serviceOperation || !_isStart;
+      if (!superseded) {
+        _isStart = false;
       }
+      await _rollbackServiceStart(operation);
+      if (superseded) return;
       if (!_disposed) {
         notifyListeners();
         showToast(translate('Failed'));
@@ -530,9 +544,22 @@ class ServerModel with ChangeNotifier {
     }
   }
 
+  Future<void> _rollbackServiceStart(int operation) async {
+    // A newer start owns the service now; an older failed operation must not
+    // tear it down while cleaning up its own state.
+    if (operation != _serviceOperation && _isStart) return;
+    try {
+      await parent.target?.invokeMethod("stop_service");
+      await bind.mainStopService();
+    } catch (error, stackTrace) {
+      debugPrint("Failed to roll back service start: $error\n$stackTrace");
+    }
+  }
+
   /// Stop the screen sharing service.
   Future<void> stopService() async {
     if (_disposed) return;
+    ++_serviceOperation;
     _isStart = false;
     try {
       await closeAll();

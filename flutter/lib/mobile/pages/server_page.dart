@@ -925,16 +925,23 @@ void androidChannelInit() {
           }
         case "on_state_changed":
           {
-            var name = arguments["name"] as String;
-            var value = arguments["value"] as String == "true";
+            if (arguments is! Map) break;
+            final name = arguments["name"]?.toString();
+            final rawValue = arguments["value"];
+            if (name == null || rawValue == null) break;
+            final value = rawValue is bool
+                ? rawValue
+                : rawValue.toString().toLowerCase() == "true";
             debugPrint("from jvm:on_state_changed,$name:$value");
             unawaited(gFFI.serverModel.changeStatue(name, value));
             break;
           }
         case "on_android_permission_result":
           {
-            var type = arguments["type"] as String;
-            var result = arguments["result"] as bool;
+            if (arguments is! Map) break;
+            final type = arguments["type"]?.toString();
+            final result = arguments["result"];
+            if (type == null || result is! bool) break;
             AndroidPermissionManager.complete(type, result);
             break;
           }
