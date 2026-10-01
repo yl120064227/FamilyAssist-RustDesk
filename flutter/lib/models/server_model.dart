@@ -631,12 +631,16 @@ class ServerModel with ChangeNotifier {
         onTap: () {},
         page: desktop.buildConnectionCard(client)));
     Future.delayed(Duration.zero, () async {
-      if (!hideCm) windowOnTop(null);
+      if (!_disposed && !hideCm) {
+        await windowOnTop(null);
+      }
     });
     // Only do the hidden task when on Desktop.
     if (client.authorized && isDesktop) {
       cmHiddenTimer = Timer(const Duration(seconds: 3), () {
-        if (!hideCm) windowManager.minimize();
+        if (!_disposed && !hideCm) {
+          windowManager.minimize();
+        }
         cmHiddenTimer = null;
       });
     }
@@ -679,6 +683,7 @@ class ServerModel with ChangeNotifier {
 
   showClientDialog(Client client, String title, String contentTitle,
       String content, VoidCallback onCancel, VoidCallback onSubmit) {
+    if (_disposed) return;
     parent.target?.dialogManager.show((setState, close, context) {
       cancel() {
         onCancel();
@@ -720,30 +725,34 @@ class ServerModel with ChangeNotifier {
     }, tag: getLoginDialogTag(client.id));
   }
 
-  scrollToBottom() {
-    if (isDesktop) return;
-    Future.delayed(Duration(milliseconds: 200), () {
-      controller.animateTo(controller.position.maxScrollExtent,
-          duration: Duration(milliseconds: 200),
-          curve: Curves.fastLinearToSlowEaseIn);
+  void scrollToBottom() {
+    if (isDesktop || _disposed) return;
+    Future.delayed(const Duration(milliseconds: 200), () {
+      if (_disposed || !controller.hasClients) return;
+      controller.animateTo(
+        controller.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 200),
+        curve: Curves.fastLinearToSlowEaseIn,
+      );
     });
   }
 
   void sendLoginResponse(Client client, bool res) async {
+    if (_disposed) return;
+    bind.cmLoginRes(connId: client.id, res: res);
+    parent.target?.invokeMethod("cancel_notification", client.id);
     if (res) {
-      bind.cmLoginRes(connId: client.id, res: res);
       if (!client.isFileTransfer && !client.isTerminal) {
         parent.target?.invokeMethod("start_capture");
       }
-      parent.target?.invokeMethod("cancel_notification", client.id);
       client.authorized = true;
-      notifyListeners();
+      if (!_disposed) notifyListeners();
     } else {
-      bind.cmLoginRes(connId: client.id, res: res);
-      parent.target?.invokeMethod("cancel_notification", client.id);
       final index = _clients.indexOf(client);
-      tabController.remove(index);
-      _clients.remove(client);
+      if (index >= 0) {
+        tabController.remove(index);
+        _clients.removeAt(index);
+      }
       if (isAndroid) androidUpdatekeepScreenOn();
     }
   }
@@ -769,7 +778,7 @@ class ServerModel with ChangeNotifier {
         hideCmWindow();
       }
       if (isAndroid) androidUpdatekeepScreenOn();
-      notifyListeners();
+      if (!_disposed) notifyListeners();
     } catch (e) {
       debugPrint("onClientRemove failed,error:$e");
     }
@@ -784,8 +793,11 @@ class ServerModel with ChangeNotifier {
   }
 
   void jumpTo(int id) {
+    if (_disposed) return;
     final index = _clients.indexWhere((client) => client.id == id);
-    tabController.jumpTo(index);
+    if (index >= 0) {
+      tabController.jumpTo(index);
+    }
   }
 
   void setShowElevation(bool show) {
@@ -808,7 +820,7 @@ class ServerModel with ChangeNotifier {
           } else {
             // Has incoming phone call, let's set the window on top.
             Future.delayed(Duration.zero, () {
-              windowOnTop(null);
+              if (!_disposed) windowOnTop(null);
             });
           }
         }
