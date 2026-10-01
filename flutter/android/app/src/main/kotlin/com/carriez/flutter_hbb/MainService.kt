@@ -249,6 +249,19 @@ class MainService : Service() {
     }
 
     override fun onDestroy() {
+        // onDestroy can be reached when Android stops the service directly,
+        // without going through destroy(). Release an active capture first,
+        // then publish the real state so Flutter does not keep stale UI.
+        try {
+            if (_isStart) {
+                stopCapture()
+            }
+        } catch (e: Exception) {
+            Log.e(logTag, "Failed to release capture during service shutdown", e)
+        }
+        _isReady = false
+        _isStart = false
+        _isAudioStart = false
         checkMediaPermission()
         stopService(Intent(this, FloatingWindowService::class.java))
         super.onDestroy()
