@@ -52,6 +52,7 @@ class ServerModel with ChangeNotifier {
   Timer? _serverTimer;
   bool _timerCallbackRunning = false;
   bool _disposed = false;
+  int _keepScreenOnGeneration = 0;
 
   final _wakelockKey = UniqueKey();
 
@@ -254,7 +255,9 @@ class ServerModel with ChangeNotifier {
     final clipOption = await bind.mainGetOption(key: kOptionEnableClipboard);
     _clipboardOk = clipOption != 'N';
 
-    notifyListeners();
+    if (!_disposed) {
+      notifyListeners();
+    }
   }
 
   updatePasswordModel() async {
@@ -666,6 +669,7 @@ class ServerModel with ChangeNotifier {
   }
 
   handleVoiceCall(Client client, bool accept) {
+    if (_disposed) return;
     parent.target?.invokeMethod("cancel_notification", client.id);
     bind.cmHandleIncomingVoiceCall(id: client.id, accept: accept);
   }
@@ -785,11 +789,20 @@ class ServerModel with ChangeNotifier {
   }
 
   Future<void> closeAll() async {
-    await Future.wait(
-        _clients.map((client) => bind.cmCloseConnection(connId: client.id)));
-    _clients.clear();
-    tabController.state.value.tabs.clear();
-    if (isAndroid) androidUpdatekeepScreenOn();
+    if (_disposed) return;
+    final clients = List<Client>.of(_clients);
+    try {
+      await Future.wait(
+          clients.map((client) => bind.cmCloseConnection(connId: client.id)),
+          eagerError: false);
+    } catch (error, stackTrace) {
+      debugPrint("Failed to close all connections: $error\n$stackTrace");
+    } finally {
+      if (_disposed) return;
+      _clients.clear();
+      tabController.state.value.tabs.clear();
+      if (isAndroid) androidUpdatekeepScreenOn();
+    }
   }
 
   void jumpTo(int id) {
@@ -801,10 +814,9 @@ class ServerModel with ChangeNotifier {
   }
 
   void setShowElevation(bool show) {
-    if (_showElevation != show) {
-      _showElevation = show;
-      notifyListeners();
-    }
+    if (_disposed || _showElevation == show) return;
+    _showElevation = show;
+    notifyListeners();
   }
 
   void updateVoiceCallState(Map<String, dynamic> evt) {
@@ -824,7 +836,7 @@ class ServerModel with ChangeNotifier {
             });
           }
         }
-        notifyListeners();
+        if (!_disposed) notifyListeners();
       }
     } catch (e) {
       debugPrint("updateVoiceCallState failed: $e");
@@ -832,10 +844,12 @@ class ServerModel with ChangeNotifier {
   }
 
   void androidUpdatekeepScreenOn() async {
-    if (!isAndroid) return;
+    if (!isAndroid || _disposed) return;
+    final generation = ++_keepScreenOnGeneration;
     var floatingWindowDisabled =
         bind.mainGetLocalOption(key: kOptionDisableFloatingWindow) == "Y" ||
             !await AndroidPermissionManager.check(kSystemAlertWindow);
+    if (_disposed || generation != _keepScreenOnGeneration) return;
     final keepScreenOn = floatingWindowDisabled
         ? KeepScreenOn.never
         : optionToKeepScreenOn(
