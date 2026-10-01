@@ -231,7 +231,8 @@ Future<void> checkService() async {
   }
   // for Android 10/11, request MANAGE_EXTERNAL_STORAGE permission from system setting page
   if (AndroidPermissionManager.isWaitingFile() && !gFFI.serverModel.fileOk) {
-    final granted = await AndroidPermissionManager.check(kManageExternalStorage);
+    final granted =
+        await AndroidPermissionManager.check(kManageExternalStorage);
     AndroidPermissionManager.complete(kManageExternalStorage, granted);
     debugPrint("file permission finished: $granted");
   }
@@ -918,7 +919,7 @@ void androidChannelInit() {
             var name = arguments["name"] as String;
             var value = arguments["value"] as String == "true";
             debugPrint("from jvm:on_state_changed,$name:$value");
-            gFFI.serverModel.changeStatue(name, value);
+            unawaited(gFFI.serverModel.changeStatue(name, value));
             break;
           }
         case "on_android_permission_result":
