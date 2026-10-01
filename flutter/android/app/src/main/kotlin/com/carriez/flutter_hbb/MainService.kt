@@ -429,10 +429,15 @@ class MainService : Service() {
         Log.d(logTag, "Start Capture")
         surface = createSurface()
 
-        if (useVP9) {
+        val videoStarted = if (useVP9) {
             startVP9VideoRecorder(mediaProjection!!)
         } else {
             startRawVideoRecorder(mediaProjection!!)
+        }
+        if (!videoStarted) {
+            Log.w(logTag, "startCapture failed while creating the video display")
+            stopCapture()
+            return false
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -522,31 +527,32 @@ class MainService : Service() {
         return isReady
     }
 
-    private fun startRawVideoRecorder(mp: MediaProjection) {
+    private fun startRawVideoRecorder(mp: MediaProjection): Boolean {
         Log.d(logTag, "startRawVideoRecorder,screen info:$SCREEN_INFO")
         if (surface == null) {
             Log.d(logTag, "startRawVideoRecorder failed,surface is null")
-            return
+            return false
         }
-        createOrSetVirtualDisplay(mp, surface!!)
+        return createOrSetVirtualDisplay(mp, surface!!)
     }
 
-    private fun startVP9VideoRecorder(mp: MediaProjection) {
+    private fun startVP9VideoRecorder(mp: MediaProjection): Boolean {
         createMediaCodec()
-        videoEncoder?.let {
+        val encoder = videoEncoder ?: return false
+        encoder.let {
             surface = it.createInputSurface()
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 surface!!.setFrameRate(1F, FRAME_RATE_COMPATIBILITY_DEFAULT)
             }
             it.setCallback(cb)
             it.start()
-            createOrSetVirtualDisplay(mp, surface!!)
         }
+        return surface?.let { createOrSetVirtualDisplay(mp, it) } ?: false
     }
 
     // https://github.com/bk138/droidVNC-NG/blob/b79af62db5a1c08ed94e6a91464859ffed6f4e97/app/src/main/java/net/christianbeier/droidvnc_ng/MediaProjectionService.java#L250
     // Reuse virtualDisplay if it exists, to avoid media projection confirmation dialog every connection.
-    private fun createOrSetVirtualDisplay(mp: MediaProjection, s: Surface) {
+    private fun createOrSetVirtualDisplay(mp: MediaProjection, s: Surface): Boolean {
         try {
             virtualDisplay?.let {
                 it.resize(SCREEN_INFO.width, SCREEN_INFO.height, SCREEN_INFO.dpi)
@@ -558,10 +564,14 @@ class MainService : Service() {
                     s, null, null
                 )
             }
+            return virtualDisplay != null
         } catch (e: SecurityException) {
             Log.w(logTag, "createOrSetVirtualDisplay: got SecurityException, re-requesting confirmation");
+            _isReady = false
+            checkMediaPermission()
             // This initiates a prompt dialog for the user to confirm screen projection.
             requestMediaProjection()
+            return false
         }
     }
 
