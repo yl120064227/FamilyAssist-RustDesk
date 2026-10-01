@@ -669,6 +669,7 @@ class ServerModel with ChangeNotifier {
   }
 
   handleVoiceCall(Client client, bool accept) {
+    if (_disposed) return;
     parent.target?.invokeMethod("cancel_notification", client.id);
     bind.cmHandleIncomingVoiceCall(id: client.id, accept: accept);
   }
@@ -813,10 +814,9 @@ class ServerModel with ChangeNotifier {
   }
 
   void setShowElevation(bool show) {
-    if (_showElevation != show) {
-      _showElevation = show;
-      notifyListeners();
-    }
+    if (_disposed || _showElevation == show) return;
+    _showElevation = show;
+    notifyListeners();
   }
 
   void updateVoiceCallState(Map<String, dynamic> evt) {
@@ -836,7 +836,7 @@ class ServerModel with ChangeNotifier {
             });
           }
         }
-        notifyListeners();
+        if (!_disposed) notifyListeners();
       }
     } catch (e) {
       debugPrint("updateVoiceCallState failed: $e");
