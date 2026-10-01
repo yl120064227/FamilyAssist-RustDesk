@@ -213,18 +213,22 @@ class MainActivity : FlutterActivity() {
                     if (call.arguments is Int) {
                         val id = call.arguments as Int
                         mainService?.cancelNotification(id)
-                    } else {
-                        result.success(true)
                     }
+                    result.success(true)
                 }
                 "enable_soft_keyboard" -> {
                     // https://blog.csdn.net/hanye2020/article/details/105553780
-                    if (call.arguments as Boolean) {
-                        window.clearFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
+                    val enabled = call.arguments as? Boolean
+                    if (enabled == null) {
+                        result.error("invalid_arguments", "Expected a boolean", null)
                     } else {
-                        window.addFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
+                        if (enabled) {
+                            window.clearFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
+                        } else {
+                            window.addFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
+                        }
+                        result.success(true)
                     }
-                    result.success(true)
 
                 }
                 "try_sync_clipboard" -> {
@@ -270,9 +274,11 @@ class MainActivity : FlutterActivity() {
                 }
                 "on_voice_call_started" -> {
                     onVoiceCallStarted()
+                    result.success(true)
                 }
                 "on_voice_call_closed" -> {
                     onVoiceCallClosed()
+                    result.success(true)
                 }
                 else -> {
                     result.error("-1", "No such method", null)

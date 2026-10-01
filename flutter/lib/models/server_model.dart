@@ -230,29 +230,35 @@ class ServerModel with ChangeNotifier {
   /// 2. check config
   /// audio true by default (if permission on) (false default < Android 10)
   /// file true by default (if permission on)
-  checkAndroidPermission() async {
+  Future<void> checkAndroidPermission() async {
+    if (_disposed) return;
     // audio
     if (androidVersion < 30 ||
         !await AndroidPermissionManager.check(kRecordAudio)) {
       _audioOk = false;
-      bind.mainSetOption(key: kOptionEnableAudio, value: "N");
+      await bind.mainSetOption(key: kOptionEnableAudio, value: "N");
     } else {
       final audioOption = await bind.mainGetOption(key: kOptionEnableAudio);
+      if (_disposed) return;
       _audioOk = audioOption != 'N';
     }
+    if (_disposed) return;
 
     // file
     if (!await AndroidPermissionManager.check(kManageExternalStorage)) {
       _fileOk = false;
-      bind.mainSetOption(key: kOptionEnableFileTransfer, value: "N");
+      await bind.mainSetOption(key: kOptionEnableFileTransfer, value: "N");
     } else {
       final fileOption =
           await bind.mainGetOption(key: kOptionEnableFileTransfer);
+      if (_disposed) return;
       _fileOk = fileOption != 'N';
     }
+    if (_disposed) return;
 
     // clipboard
     final clipOption = await bind.mainGetOption(key: kOptionEnableClipboard);
+    if (_disposed) return;
     _clipboardOk = clipOption != 'N';
 
     if (!_disposed) {
@@ -350,9 +356,9 @@ class ServerModel with ChangeNotifier {
     }
 
     _audioOk = !_audioOk;
-    bind.mainSetOption(
+    await bind.mainSetOption(
         key: kOptionEnableAudio, value: _audioOk ? defaultOptionYes : 'N');
-    notifyListeners();
+    if (!_disposed) notifyListeners();
   }
 
   Future<void> toggleFile() async {
@@ -371,18 +377,22 @@ class ServerModel with ChangeNotifier {
     }
 
     _fileOk = !_fileOk;
-    bind.mainSetOption(
+    await bind.mainSetOption(
         key: kOptionEnableFileTransfer,
         value: _fileOk ? defaultOptionYes : 'N');
-    notifyListeners();
+    if (!_disposed) notifyListeners();
   }
 
-  toggleClipboard() async {
-    _clipboardOk = !clipboardOk;
-    bind.mainSetOption(
+  Future<void> toggleClipboard() async {
+    if (clients.any((c) => !c.disconnected)) {
+      await showClientsMayNotBeChangedAlert(parent.target);
+      return;
+    }
+    _clipboardOk = !_clipboardOk;
+    await bind.mainSetOption(
         key: kOptionEnableClipboard,
-        value: clipboardOk ? defaultOptionYes : 'N');
-    notifyListeners();
+        value: _clipboardOk ? defaultOptionYes : 'N');
+    if (!_disposed) notifyListeners();
   }
 
   Future<void> toggleInput() async {
@@ -392,7 +402,7 @@ class ServerModel with ChangeNotifier {
     }
     if (_inputOk) {
       parent.target?.invokeMethod("stop_input");
-      bind.mainSetOption(key: kOptionEnableKeyboard, value: 'N');
+      await bind.mainSetOption(key: kOptionEnableKeyboard, value: 'N');
     } else {
       if (parent.target != null) {
         /// the result of toggle-on depends on user actions in the settings page.
@@ -547,27 +557,43 @@ class ServerModel with ChangeNotifier {
     }
   }
 
-  changeStatue(String name, bool value) {
+  Future<void> changeStatue(String name, bool value) async {
+    if (_disposed) return;
     debugPrint("changeStatue value $value");
-    switch (name) {
-      case "media":
-        _mediaOk = value;
-        if (value && !_isStart) {
-          startService();
-        }
-        break;
-      case "input":
-        if (_inputOk != value) {
-          bind.mainSetOption(
-              key: kOptionEnableKeyboard,
-              value: value ? defaultOptionYes : 'N');
-        }
-        _inputOk = value;
-        break;
-      default:
-        return;
+    try {
+      switch (name) {
+        case "media":
+          _mediaOk = value;
+          if (value) {
+            if (!_isStart) {
+              await startService();
+            }
+          } else {
+            // MediaProjection can be revoked outside Flutter. Clear the local
+            // service state and close stale sessions so a later retry can start.
+            _isStart = false;
+            if (_clients.isNotEmpty) {
+              await closeAll();
+            }
+            androidUpdatekeepScreenOn();
+          }
+          break;
+        case "input":
+          if (_inputOk != value) {
+            await bind.mainSetOption(
+                key: kOptionEnableKeyboard,
+                value: value ? defaultOptionYes : 'N');
+          }
+          _inputOk = value;
+          break;
+        default:
+          return;
+      }
+    } catch (error, stackTrace) {
+      debugPrint("Failed to update Android service state: $error\n$stackTrace");
+    } finally {
+      if (!_disposed) notifyListeners();
     }
-    notifyListeners();
   }
 
   // force
@@ -790,7 +816,7 @@ class ServerModel with ChangeNotifier {
       client.authorized = true;
       if (!_disposed) notifyListeners();
     } else {
-      final index = _clients.indexOf(client);
+      final index = _clients.indexWhere((item) => item.id == client.id);
       if (index >= 0) {
         tabController.remove(index);
         _clients.removeAt(index);
@@ -801,8 +827,11 @@ class ServerModel with ChangeNotifier {
 
   void onClientRemove(Map<String, dynamic> evt) {
     try {
-      final id = int.parse(evt['id'] as String);
-      final close = (evt['close'] as String) == 'true';
+      final id = int.tryParse(evt['id']?.toString() ?? '');
+      if (id == null) return;
+      final closeValue = evt['close'];
+      final close =
+          closeValue == true || closeValue?.toString().toLowerCase() == 'true';
       if (_clients.any((c) => c.id == id)) {
         final index = _clients.indexWhere((client) => client.id == id);
         if (index >= 0) {

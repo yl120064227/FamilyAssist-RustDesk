@@ -179,27 +179,36 @@ class _DropDownAction extends StatelessWidget {
   }
 }
 
-class _ServerPageState extends State<ServerPage> {
+class _ServerPageState extends State<ServerPage> with WidgetsBindingObserver {
   Timer? _updateTimer;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _updateTimer = periodic_immediate(const Duration(seconds: 3), () async {
       await gFFI.serverModel.fetchID();
     });
     gFFI.serverModel.checkAndroidPermission();
+    unawaited(checkService());
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _updateTimer?.cancel();
     super.dispose();
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(checkService());
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
-    checkService();
     return ChangeNotifierProvider.value(
         value: gFFI.serverModel,
         child: Consumer<ServerModel>(
@@ -223,13 +232,18 @@ class _ServerPageState extends State<ServerPage> {
   }
 }
 
-void checkService() async {
-  gFFI.invokeMethod("check_service");
+Future<void> checkService() async {
+  try {
+    await gFFI.invokeMethod("check_service");
+  } catch (error, stackTrace) {
+    debugPrint("Failed to check Android service state: $error\n$stackTrace");
+  }
   // for Android 10/11, request MANAGE_EXTERNAL_STORAGE permission from system setting page
   if (AndroidPermissionManager.isWaitingFile() && !gFFI.serverModel.fileOk) {
-    AndroidPermissionManager.complete(kManageExternalStorage,
-        await AndroidPermissionManager.check(kManageExternalStorage));
-    debugPrint("file permission finished");
+    final granted =
+        await AndroidPermissionManager.check(kManageExternalStorage);
+    AndroidPermissionManager.complete(kManageExternalStorage, granted);
+    debugPrint("file permission finished: $granted");
   }
 }
 
@@ -914,7 +928,7 @@ void androidChannelInit() {
             var name = arguments["name"] as String;
             var value = arguments["value"] as String == "true";
             debugPrint("from jvm:on_state_changed,$name:$value");
-            gFFI.serverModel.changeStatue(name, value);
+            unawaited(gFFI.serverModel.changeStatue(name, value));
             break;
           }
         case "on_android_permission_result":
