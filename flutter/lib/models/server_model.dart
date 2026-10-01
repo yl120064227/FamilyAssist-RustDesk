@@ -638,7 +638,9 @@ class ServerModel with ChangeNotifier {
     // Only do the hidden task when on Desktop.
     if (client.authorized && isDesktop) {
       cmHiddenTimer = Timer(const Duration(seconds: 3), () {
-        if (!hideCm) windowManager.minimize();
+        if (!_disposed && !hideCm) {
+          windowManager.minimize();
+        }
         cmHiddenTimer = null;
       });
     }
@@ -681,6 +683,7 @@ class ServerModel with ChangeNotifier {
 
   showClientDialog(Client client, String title, String contentTitle,
       String content, VoidCallback onCancel, VoidCallback onSubmit) {
+    if (_disposed) return;
     parent.target?.dialogManager.show((setState, close, context) {
       cancel() {
         onCancel();
@@ -790,8 +793,11 @@ class ServerModel with ChangeNotifier {
   }
 
   void jumpTo(int id) {
+    if (_disposed) return;
     final index = _clients.indexWhere((client) => client.id == id);
-    tabController.jumpTo(index);
+    if (index >= 0) {
+      tabController.jumpTo(index);
+    }
   }
 
   void setShowElevation(bool show) {
