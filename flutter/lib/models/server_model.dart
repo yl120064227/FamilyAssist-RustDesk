@@ -52,6 +52,7 @@ class ServerModel with ChangeNotifier {
   Timer? _serverTimer;
   bool _timerCallbackRunning = false;
   bool _disposed = false;
+  int _keepScreenOnGeneration = 0;
 
   final _wakelockKey = UniqueKey();
 
@@ -785,8 +786,12 @@ class ServerModel with ChangeNotifier {
   }
 
   Future<void> closeAll() async {
+    if (_disposed) return;
+    final clients = List<Client>.of(_clients);
     await Future.wait(
-        _clients.map((client) => bind.cmCloseConnection(connId: client.id)));
+        clients.map((client) => bind.cmCloseConnection(connId: client.id)),
+        eagerError: false);
+    if (_disposed) return;
     _clients.clear();
     tabController.state.value.tabs.clear();
     if (isAndroid) androidUpdatekeepScreenOn();
@@ -832,10 +837,12 @@ class ServerModel with ChangeNotifier {
   }
 
   void androidUpdatekeepScreenOn() async {
-    if (!isAndroid) return;
+    if (!isAndroid || _disposed) return;
+    final generation = ++_keepScreenOnGeneration;
     var floatingWindowDisabled =
         bind.mainGetLocalOption(key: kOptionDisableFloatingWindow) == "Y" ||
             !await AndroidPermissionManager.check(kSystemAlertWindow);
+    if (_disposed || generation != _keepScreenOnGeneration) return;
     final keepScreenOn = floatingWindowDisabled
         ? KeepScreenOn.never
         : optionToKeepScreenOn(
