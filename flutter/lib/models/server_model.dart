@@ -788,13 +788,18 @@ class ServerModel with ChangeNotifier {
   Future<void> closeAll() async {
     if (_disposed) return;
     final clients = List<Client>.of(_clients);
-    await Future.wait(
-        clients.map((client) => bind.cmCloseConnection(connId: client.id)),
-        eagerError: false);
-    if (_disposed) return;
-    _clients.clear();
-    tabController.state.value.tabs.clear();
-    if (isAndroid) androidUpdatekeepScreenOn();
+    try {
+      await Future.wait(
+          clients.map((client) => bind.cmCloseConnection(connId: client.id)),
+          eagerError: false);
+    } catch (error, stackTrace) {
+      debugPrint("Failed to close all connections: $error\n$stackTrace");
+    } finally {
+      if (_disposed) return;
+      _clients.clear();
+      tabController.state.value.tabs.clear();
+      if (isAndroid) androidUpdatekeepScreenOn();
+    }
   }
 
   void jumpTo(int id) {
