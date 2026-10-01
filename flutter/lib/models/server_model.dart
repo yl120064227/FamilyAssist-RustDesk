@@ -735,20 +735,21 @@ class ServerModel with ChangeNotifier {
   }
 
   void sendLoginResponse(Client client, bool res) async {
+    if (_disposed) return;
+    bind.cmLoginRes(connId: client.id, res: res);
+    parent.target?.invokeMethod("cancel_notification", client.id);
     if (res) {
-      bind.cmLoginRes(connId: client.id, res: res);
       if (!client.isFileTransfer && !client.isTerminal) {
         parent.target?.invokeMethod("start_capture");
       }
-      parent.target?.invokeMethod("cancel_notification", client.id);
       client.authorized = true;
-      notifyListeners();
+      if (!_disposed) notifyListeners();
     } else {
-      bind.cmLoginRes(connId: client.id, res: res);
-      parent.target?.invokeMethod("cancel_notification", client.id);
       final index = _clients.indexOf(client);
-      tabController.remove(index);
-      _clients.remove(client);
+      if (index >= 0) {
+        tabController.remove(index);
+        _clients.removeAt(index);
+      }
       if (isAndroid) androidUpdatekeepScreenOn();
     }
   }
@@ -774,7 +775,7 @@ class ServerModel with ChangeNotifier {
         hideCmWindow();
       }
       if (isAndroid) androidUpdatekeepScreenOn();
-      notifyListeners();
+      if (!_disposed) notifyListeners();
     } catch (e) {
       debugPrint("onClientRemove failed,error:$e");
     }
@@ -813,7 +814,7 @@ class ServerModel with ChangeNotifier {
           } else {
             // Has incoming phone call, let's set the window on top.
             Future.delayed(Duration.zero, () {
-              windowOnTop(null);
+              if (!_disposed) windowOnTop(null);
             });
           }
         }
