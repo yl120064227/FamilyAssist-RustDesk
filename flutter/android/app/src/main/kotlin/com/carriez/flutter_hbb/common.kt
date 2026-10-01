@@ -72,13 +72,13 @@ fun requestPermission(context: Context, type: String) {
     XXPermissions.with(context)
         .permission(type)
         .request { _, all ->
-            if (all) {
-                Handler(Looper.getMainLooper()).post {
-                    MainActivity.flutterMethodChannel?.invokeMethod(
-                        "on_android_permission_result",
-                        mapOf("type" to type, "result" to all)
-                    )
-                }
+            // Always report the result. When the user denies the request,
+            // omitting this callback leaves Flutter waiting until its timeout.
+            Handler(Looper.getMainLooper()).post {
+                MainActivity.flutterMethodChannel?.invokeMethod(
+                    "on_android_permission_result",
+                    mapOf("type" to type, "result" to all)
+                )
             }
         }
 }
