@@ -631,7 +631,9 @@ class ServerModel with ChangeNotifier {
         onTap: () {},
         page: desktop.buildConnectionCard(client)));
     Future.delayed(Duration.zero, () async {
-      if (!hideCm) windowOnTop(null);
+      if (!_disposed && !hideCm) {
+        await windowOnTop(null);
+      }
     });
     // Only do the hidden task when on Desktop.
     if (client.authorized && isDesktop) {
@@ -720,12 +722,15 @@ class ServerModel with ChangeNotifier {
     }, tag: getLoginDialogTag(client.id));
   }
 
-  scrollToBottom() {
-    if (isDesktop) return;
-    Future.delayed(Duration(milliseconds: 200), () {
-      controller.animateTo(controller.position.maxScrollExtent,
-          duration: Duration(milliseconds: 200),
-          curve: Curves.fastLinearToSlowEaseIn);
+  void scrollToBottom() {
+    if (isDesktop || _disposed) return;
+    Future.delayed(const Duration(milliseconds: 200), () {
+      if (_disposed || !controller.hasClients) return;
+      controller.animateTo(
+        controller.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 200),
+        curve: Curves.fastLinearToSlowEaseIn,
+      );
     });
   }
 
