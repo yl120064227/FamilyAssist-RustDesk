@@ -1519,13 +1519,13 @@ class AccessibilityListener extends StatelessWidget {
 class AndroidPermissionManager {
   static Completer<bool>? _completer;
   static Timer? _timer;
-  static var _current = "";
+  static String _current = "";
 
   static bool isWaitingFile() {
-    if (_completer != null) {
-      return !_completer!.isCompleted && _current == kManageExternalStorage;
-    }
-    return false;
+    final completer = _completer;
+    return completer != null &&
+        !completer.isCompleted &&
+        _current == kManageExternalStorage;
   }
 
   static Future<bool> check(String type) {
@@ -1540,6 +1540,26 @@ class AndroidPermissionManager {
     gFFI.invokeMethod(AndroidChannel.kStartAction, action);
   }
 
+  static void _cancelCurrentRequest() {
+    final completer = _completer;
+    _completer = null;
+    _timer?.cancel();
+    _timer = null;
+    _current = "";
+    if (completer != null && !completer.isCompleted) {
+      completer.complete(false);
+    }
+  }
+
+  static Future<void> _requestNative(String type) async {
+    try {
+      await gFFI.invokeMethod("request_permission", type);
+    } catch (error, stackTrace) {
+      debugPrint("Permission request failed: $error\n$stackTrace");
+      complete(type, false);
+    }
+  }
+
   /// We use XXPermissions to request permissions,
   /// for supported types, see https://github.com/getActivity/XXPermissions/blob/e46caea32a64ad7819df62d448fb1c825481cd28/library/src/main/java/com/hjq/permissions/Permission.java
   static Future<bool> request(String type) {
@@ -1547,35 +1567,44 @@ class AndroidPermissionManager {
       return Future.value(true);
     }
 
-    gFFI.invokeMethod("request_permission", type);
-
-    // clear last task
-    if (_completer?.isCompleted == false) {
-      _completer?.complete(false);
+    // A second request for the same permission cannot be distinguished from
+    // the first Android callback. Reuse the pending Future instead of letting
+    // a stale callback complete the newer request.
+    final pending = _completer;
+    if (pending != null && !pending.isCompleted && _current == type) {
+      return pending.future;
     }
-    _timer?.cancel();
+    _cancelCurrentRequest();
 
+    final completer = Completer<bool>();
+    _completer = completer;
     _current = type;
-    _completer = Completer<bool>();
-
-    _timer = Timer(Duration(seconds: 120), () {
-      if (_completer == null) return;
-      if (!_completer!.isCompleted) {
-        _completer!.complete(false);
-      }
+    _timer = Timer(const Duration(seconds: 120), () {
+      if (!identical(_completer, completer)) return;
       _completer = null;
+      _timer = null;
       _current = "";
+      if (!completer.isCompleted) {
+        completer.complete(false);
+      }
     });
-    return _completer!.future;
+
+    unawaited(_requestNative(type));
+    return completer.future;
   }
 
-  static complete(String type, bool res) {
-    if (type != _current) {
-      res = false;
+  static void complete(String type, bool res) {
+    final completer = _completer;
+    if (completer == null || completer.isCompleted || type != _current) {
+      // Ignore callbacks from an earlier request or callbacks delivered twice
+      // by the Android permission library.
+      return;
     }
     _timer?.cancel();
-    _completer?.complete(res);
+    _timer = null;
+    _completer = null;
     _current = "";
+    completer.complete(res);
   }
 }
 
