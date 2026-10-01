@@ -560,36 +560,40 @@ class ServerModel with ChangeNotifier {
   Future<void> changeStatue(String name, bool value) async {
     if (_disposed) return;
     debugPrint("changeStatue value $value");
-    switch (name) {
-      case "media":
-        _mediaOk = value;
-        if (value) {
-          if (!_isStart) {
-            await startService();
+    try {
+      switch (name) {
+        case "media":
+          _mediaOk = value;
+          if (value) {
+            if (!_isStart) {
+              await startService();
+            }
+          } else {
+            // MediaProjection can be revoked outside Flutter. Clear the local
+            // service state and close stale sessions so a later retry can start.
+            _isStart = false;
+            if (_clients.isNotEmpty) {
+              await closeAll();
+            }
+            androidUpdatekeepScreenOn();
           }
-        } else {
-          // MediaProjection can be revoked outside Flutter. Clear the local
-          // service state and close stale sessions so a later retry can start.
-          final wasStarted = _isStart;
-          _isStart = false;
-          if (wasStarted) {
-            await closeAll();
+          break;
+        case "input":
+          if (_inputOk != value) {
+            await bind.mainSetOption(
+                key: kOptionEnableKeyboard,
+                value: value ? defaultOptionYes : 'N');
           }
-          androidUpdatekeepScreenOn();
-        }
-        break;
-      case "input":
-        if (_inputOk != value) {
-          await bind.mainSetOption(
-              key: kOptionEnableKeyboard,
-              value: value ? defaultOptionYes : 'N');
-        }
-        _inputOk = value;
-        break;
-      default:
-        return;
+          _inputOk = value;
+          break;
+        default:
+          return;
+      }
+    } catch (error, stackTrace) {
+      debugPrint("Failed to update Android service state: $error\n$stackTrace");
+    } finally {
+      if (!_disposed) notifyListeners();
     }
-    if (!_disposed) notifyListeners();
   }
 
   // force
@@ -826,8 +830,8 @@ class ServerModel with ChangeNotifier {
       final id = int.tryParse(evt['id']?.toString() ?? '');
       if (id == null) return;
       final closeValue = evt['close'];
-      final close = closeValue == true ||
-          closeValue?.toString().toLowerCase() == 'true';
+      final close =
+          closeValue == true || closeValue?.toString().toLowerCase() == 'true';
       if (_clients.any((c) => c.id == id)) {
         final index = _clients.indexWhere((client) => client.id == id);
         if (index >= 0) {
