@@ -179,12 +179,13 @@ class _DropDownAction extends StatelessWidget {
   }
 }
 
-class _ServerPageState extends State<ServerPage> {
+class _ServerPageState extends State<ServerPage> with WidgetsBindingObserver {
   Timer? _updateTimer;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _updateTimer = periodic_immediate(const Duration(seconds: 3), () async {
       await gFFI.serverModel.fetchID();
     });
@@ -194,8 +195,16 @@ class _ServerPageState extends State<ServerPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _updateTimer?.cancel();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(checkService());
+    }
   }
 
   @override
