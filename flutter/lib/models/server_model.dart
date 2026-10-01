@@ -255,7 +255,9 @@ class ServerModel with ChangeNotifier {
     final clipOption = await bind.mainGetOption(key: kOptionEnableClipboard);
     _clipboardOk = clipOption != 'N';
 
-    notifyListeners();
+    if (!_disposed) {
+      notifyListeners();
+    }
   }
 
   updatePasswordModel() async {
