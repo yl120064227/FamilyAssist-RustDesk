@@ -2372,7 +2372,12 @@ impl Connection {
         #[cfg(feature = "flutter")]
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
-            let access_mode = Config::get_option("access-mode");
+            let access_mode = if crate::family_guard::enabled() {
+                // 家庭守卫：access-mode=full 是一键放权旁路面，视同未设置
+                String::new()
+            } else {
+                Config::get_option("access-mode")
+            };
             if access_mode == "full" {
                 return true;
             } else if access_mode == "view" {
@@ -2432,6 +2437,10 @@ impl Connection {
 
     #[inline]
     fn enable_trusted_devices() -> bool {
+        if crate::family_guard::enabled() {
+            // 家庭守卫：信任设备是 2FA 旁路面，一律禁用
+            return false;
+        }
         config::option2bool(
             keys::OPTION_ENABLE_TRUSTED_DEVICES,
             &Config::get_option(keys::OPTION_ENABLE_TRUSTED_DEVICES),
@@ -2669,12 +2678,19 @@ impl Connection {
             #[cfg(any(target_os = "android", target_os = "ios"))]
             let is_logon = || crate::platform::is_prelogin();
 
-            let allow_logon_screen_password =
-                crate::get_builtin_option(keys::OPTION_ALLOW_LOGON_SCREEN_PASSWORD) == "Y"
+            let allow_logon_screen_password = !crate::family_guard::enabled()
+                && crate::get_builtin_option(keys::OPTION_ALLOW_LOGON_SCREEN_PASSWORD) == "Y"
                     && is_logon();
 
-            if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)
-                || password::approve_mode() == ApproveMode::Both && !password::has_valid_password()
+            // 家庭守卫：强制 Click 模式——密码（含一次性密码）不构成免确认直入
+            let approve_mode = if crate::family_guard::enabled() {
+                ApproveMode::Click
+            } else {
+                password::approve_mode()
+            };
+
+            if (approve_mode == ApproveMode::Click && !allow_logon_screen_password)
+                || approve_mode == ApproveMode::Both && !password::has_valid_password()
             {
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 if should_use_terminal_os_login_scope(self.terminal, &lr.os_login.username) {
