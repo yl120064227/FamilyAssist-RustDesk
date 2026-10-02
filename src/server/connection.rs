@@ -93,6 +93,9 @@ lazy_static::lazy_static! {
 #[cfg(target_os = "windows")]
 const TERMINAL_OS_LOGIN_FAILED_MSG: &str = "Incorrect username or password.";
 
+/// 家庭守卫：已有控制会话时拒绝新控制连接的提示
+const LOGIN_MSG_ANOTHER_CONTROLLER: &str = "Another session is in control";
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -2355,6 +2358,23 @@ impl Connection {
                 && (tfa && session.tfa
                     || !tfa && self.validate_password_plain(&session.random_password))
             {
+                if crate::family_guard::enabled() {
+                    // 家庭守卫：仅豁免伴生连接（同一会话仍有活跃授权连接，如会话内
+                    // 打开文件标签复用 session token 的 FileTransfer）。
+                    // 断线重连时原连接已从 AUTHED_CONNS 移除——必须重新经本机确认。
+                    let key = self.session_key();
+                    let has_active_conn = AUTHED_CONNS
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|c| c.session_key == key);
+                    if !has_active_conn {
+                        log::info!(
+                            "family guard: session resumption denied, on-device re-consent required"
+                        );
+                        return false;
+                    }
+                }
                 if tfa {
                     self.set_conn_audit_two_factor(ConnAuditTwoFactor::Totp);
                 } else {
@@ -2601,6 +2621,29 @@ impl Connection {
                 self.send_login_error(crate::client::LOGIN_MSG_OFFLINE)
                     .await;
                 return false;
+            }
+
+            // 家庭守卫：单控制者——已存在活跃 Remote 授权连接时拒绝新的控制连接
+            //（伴生连接除外：同 session_key 复用会话 token 的 FileTransfer 等，
+            //  由 is_recent_session 的家庭分支放行）。拒绝发生在弹确认框之前，
+            //  不打扰被控端长辈。
+            if crate::family_guard::enabled() {
+                let key = self.session_key();
+                let (has_remote, is_companion) = {
+                    let conns = AUTHED_CONNS.lock().unwrap();
+                    (
+                        conns.iter().any(|c| c.conn_type == AuthConnType::Remote),
+                        conns.iter().any(|c| c.session_key == key),
+                    )
+                };
+                if has_remote && !is_companion {
+                    log::info!(
+                        "family guard: rejected additional controller while a session is active"
+                    );
+                    self.send_login_error(LOGIN_MSG_ANOTHER_CONTROLLER).await;
+                    sleep(1.).await;
+                    return false;
+                }
             }
 
             #[cfg(target_os = "windows")]
