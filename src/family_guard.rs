@@ -22,9 +22,20 @@ use hbb_common::{
 
 pub const OPTION_FAMILY_GUARD: &str = "family-guard";
 
+/// 确认等待超时（秒）的本地配置键——超时未确认按拒绝处理；开发/测试可调小
+pub const OPTION_CONSENT_TIMEOUT: &str = "family-guard-consent-timeout";
+const DEFAULT_CONSENT_TIMEOUT_SECS: u64 = 60;
+
 /// 家庭守卫是否启用（默认启用；本地显式置 "N" 关闭，仅供开发）
 pub fn enabled() -> bool {
     crate::get_local_option(OPTION_FAMILY_GUARD) != "N"
+}
+
+/// 确认等待超时秒数（默认 60；LocalConfig 可覆盖，非法值回退默认）
+pub fn consent_timeout_secs() -> u64 {
+    crate::get_local_option(OPTION_CONSENT_TIMEOUT)
+        .parse()
+        .unwrap_or(DEFAULT_CONSENT_TIMEOUT_SECS)
 }
 
 /// 在 `load_custom_client()` 之后调用：先清危险存量，再注入锁定。

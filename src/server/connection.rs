@@ -318,6 +318,9 @@ pub struct Connection {
     port_forward_socket: Option<Framed<TcpStream, BytesCodec>>,
     port_forward_address: String,
     tx_to_cm: mpsc::UnboundedSender<ipc::Data>,
+    // clone of the tx_from_cm channel sender; used by the family-guard consent
+    // timeout task to feed ipc::Data::Close back into this connection's loop
+    tx_cm_event: mpsc::UnboundedSender<ipc::Data>,
     authorized: bool,
     require_2fa: Option<totp_rs::TOTP>,
     keyboard: bool,
@@ -519,6 +522,7 @@ impl Connection {
             port_forward_socket: None,
             port_forward_address: "".to_owned(),
             tx_to_cm,
+            tx_cm_event: tx_from_cm.clone(),
             authorized: false,
             keyboard: Self::permission(keys::OPTION_ENABLE_KEYBOARD, &control_permissions),
             clipboard: Self::permission(keys::OPTION_ENABLE_CLIPBOARD, &control_permissions),
@@ -2743,6 +2747,30 @@ impl Connection {
                     }
                 }
                 self.try_start_cm(lr.my_id, lr.my_name, false);
+                // 家庭守卫（WP3）：确认等待超时——超时后仍未授权则按拒绝断连。
+                // 授权成功时 AuthedConnID 已进入 AUTHED_CONNS，超时任务检测到即不再动作；
+                // 用户提前 Dismiss 后连接已退出循环，向已关闭通道发送 Close 返回错误被忽略。
+                if crate::family_guard::enabled() {
+                    let conn_id = self.inner.id();
+                    let tx = self.tx_cm_event.clone();
+                    let timeout =
+                        std::time::Duration::from_secs(crate::family_guard::consent_timeout_secs());
+                    tokio::spawn(async move {
+                        tokio::time::sleep(timeout).await;
+                        let authed = AUTHED_CONNS
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|c| c.conn_id == conn_id);
+                        if !authed {
+                            log::info!(
+                                "family guard: consent timeout after {:?}, closing pending connection",
+                                timeout
+                            );
+                            let _ = tx.send(ipc::Data::Close);
+                        }
+                    });
+                }
                 if hbb_common::get_version_number(&lr.version)
                     >= hbb_common::get_version_number("1.2.0")
                 {
