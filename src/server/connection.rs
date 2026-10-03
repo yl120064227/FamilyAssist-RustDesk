@@ -1170,14 +1170,15 @@ impl Connection {
         conn.on_close("End", true).await;
         // 家庭守卫（WP4）：安卓没有桌面 ipc_task 的退出清理路径（start_listen 收到
         // Close 直接 break）——连接断开时 CLIENTS/确认弹窗/通知会永久残留。
-        // 在此显式触发 remove_connection：CLIENTS 移除 + on_client_remove 事件
-        // （flutter 侧 dismissByTag 清弹窗 + 移除卡片 + 取消通知）。
+        // 在此触发 UI 清理（CLIENTS 移除 + on_client_remove 事件，flutter 侧
+        // dismissByTag 清弹窗）。注意用 ui_only 版本：不带 stop_capture 副作用，
+        // 否则拒绝/超时场景（从未真正共享）会打断 MediaProjection。
         #[cfg(target_os = "android")]
         {
             crate::ui_cm_interface::ConnectionManager {
                 ui_handler: crate::flutter::connection_manager::FlutterHandler {},
             }
-            .remove_connection(id, true);
+            .remove_connection_ui_only(id);
         }
         log::info!("#{} connection loop exited", id);
     }
