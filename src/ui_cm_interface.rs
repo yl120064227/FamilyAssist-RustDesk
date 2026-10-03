@@ -279,7 +279,7 @@ impl<T: InvokeUiCM> ConnectionManager<T> {
             .unwrap_or(false)
     }
 
-    fn remove_connection(&self, id: i32, close: bool) {
+    pub fn remove_connection(&self, id: i32, close: bool) {
         if close {
             CLIENTS.write().unwrap().remove(&id);
         } else {

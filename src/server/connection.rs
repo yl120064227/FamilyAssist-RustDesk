@@ -81,6 +81,8 @@ lazy_static::lazy_static! {
     pub static ref CONTROL_PERMISSIONS_ARRAY: Arc::<Mutex<Vec<(i32, ControlPermissions)>>> = Default::default();
     static ref WAKELOCK_SENDER: Arc::<Mutex<std::sync::mpsc::Sender<(usize, usize)>>> = Arc::new(Mutex::new(start_wakelock_thread()));
     static ref WAKELOCK_KEEP_AWAKE_OPTION: Arc::<Mutex<Option<bool>>> = Default::default();
+    // 家庭守卫：等待本机确认（Click 弹窗挂起中）的连接 id 集合——单 pending 约束
+    static ref PENDING_CONSENT_CONNS: Arc::<Mutex<HashSet<i32>>> = Default::default();
 }
 
 #[cfg(feature = "flutter")]
@@ -95,6 +97,9 @@ const TERMINAL_OS_LOGIN_FAILED_MSG: &str = "Incorrect username or password.";
 
 /// 家庭守卫：已有控制会话时拒绝新控制连接的提示
 const LOGIN_MSG_ANOTHER_CONTROLLER: &str = "Another session is in control";
+
+/// 家庭守卫：已有确认请求挂起时拒绝新连接的提示（单 pending，防弹窗堆积）
+const LOGIN_MSG_PENDING_CONFIRMATION: &str = "Another confirmation is pending";
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -321,6 +326,8 @@ pub struct Connection {
     // clone of the tx_from_cm channel sender; used by the family-guard consent
     // timeout task to feed ipc::Data::Close back into this connection's loop
     tx_cm_event: mpsc::UnboundedSender<ipc::Data>,
+    // 家庭守卫：Click 确认挂起守卫（单 pending 约束）
+    pending_consent_guard: Option<raii::PendingConsentID>,
     authorized: bool,
     require_2fa: Option<totp_rs::TOTP>,
     keyboard: bool,
@@ -523,6 +530,7 @@ impl Connection {
             port_forward_address: "".to_owned(),
             tx_to_cm,
             tx_cm_event: tx_from_cm.clone(),
+            pending_consent_guard: None,
             authorized: false,
             keyboard: Self::permission(keys::OPTION_ENABLE_KEYBOARD, &control_permissions),
             clipboard: Self::permission(keys::OPTION_ENABLE_CLIPBOARD, &control_permissions),
@@ -683,6 +691,8 @@ impl Connection {
                         ipc::Data::Authorize => {
                             conn.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::Click);
                             conn.require_2fa.take();
+                            // 家庭守卫（WP4）：授权完成即释放 pending 槽
+                            conn.pending_consent_guard = None;
                             if !conn.send_logon_response_and_keep_alive().await {
                                 break;
                             }
@@ -1158,6 +1168,17 @@ impl Connection {
             try_stop_record_cursor_pos();
         }
         conn.on_close("End", true).await;
+        // 家庭守卫（WP4）：安卓没有桌面 ipc_task 的退出清理路径（start_listen 收到
+        // Close 直接 break）——连接断开时 CLIENTS/确认弹窗/通知会永久残留。
+        // 在此显式触发 remove_connection：CLIENTS 移除 + on_client_remove 事件
+        // （flutter 侧 dismissByTag 清弹窗 + 移除卡片 + 取消通知）。
+        #[cfg(target_os = "android")]
+        {
+            crate::ui_cm_interface::ConnectionManager {
+                ui_handler: crate::flutter::connection_manager::FlutterHandler {},
+            }
+            .remove_connection(id, true);
+        }
         log::info!("#{} connection loop exited", id);
     }
 
@@ -2745,6 +2766,28 @@ impl Connection {
                     {
                         return keep_alive;
                     }
+                }
+                // 家庭守卫（WP4）：单 pending——已有确认请求挂起时拒绝新连接，
+                // 从根上杜绝确认弹窗堆积（同 peer 或不同 peer 均适用）。
+                if crate::family_guard::enabled() {
+                    let pending_exists = {
+                        let mut pend = PENDING_CONSENT_CONNS.lock().unwrap();
+                        if pend.is_empty() {
+                            pend.insert(self.inner.id());
+                            false
+                        } else {
+                            true
+                        }
+                    };
+                    if pending_exists {
+                        log::info!(
+                            "family guard: rejected connection while another confirmation is pending"
+                        );
+                        self.send_login_error(LOGIN_MSG_PENDING_CONFIRMATION).await;
+                        sleep(1.).await;
+                        return false;
+                    }
+                    self.pending_consent_guard = Some(raii::PendingConsentID::new(self.inner.id()));
                 }
                 self.try_start_cm(lr.my_id, lr.my_name, false);
                 // 家庭守卫（WP3）：确认等待超时——超时后仍未授权则按拒绝断连。
@@ -6548,6 +6591,26 @@ mod raii {
     }
 
     pub struct AuthedConnID(i32, AuthConnType);
+
+    /// 家庭守卫：Click 确认挂起状态的 RAII 守卫——连接结束（任何路径）自动从
+    /// PENDING_CONSENT_CONNS 移除；授权成功时由 Authorize 处理主动释放
+    pub struct PendingConsentID(i32);
+
+    impl PendingConsentID {
+        pub fn new(id: i32) -> Self {
+            PENDING_CONSENT_CONNS.lock().unwrap().insert(id);
+            Self(id)
+        }
+    }
+
+    impl Drop for PendingConsentID {
+        fn drop(&mut self) {
+            PENDING_CONSENT_CONNS
+                .lock()
+                .unwrap()
+                .retain(|&c| c != self.0);
+        }
+    }
 
     impl AuthedConnID {
         pub fn new(
