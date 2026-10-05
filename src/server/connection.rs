@@ -703,6 +703,12 @@ impl Connection {
                             conn.require_2fa.take();
                             // 家庭守卫（WP4）：授权完成即释放 pending 槽
                             conn.pending_consent_guard = None;
+                            // 家庭守卫（WP7）：审计——本机确认授权（controller 标识脱敏）
+                            crate::family_guard::audit_event(
+                                "authorized",
+                                conn.inner.id(),
+                                &format!("peer={}|name={}", conn.lr.my_id, conn.lr.my_name),
+                            );
                             if !conn.send_logon_response_and_keep_alive().await {
                                 break;
                             }
@@ -2829,6 +2835,10 @@ impl Connection {
                     }
                     self.pending_consent_guard = Some(raii::PendingConsentID::new(self.inner.id()));
                 }
+                // 家庭守卫（WP7）：审计——确认请求发起（controller 标识脱敏）；
+                // 先取标识再 move 给 try_start_cm
+                let audit_peer = format!("peer={}|name={}", lr.my_id, lr.my_name);
+                crate::family_guard::audit_event("consent_asked", self.inner.id(), &audit_peer);
                 self.try_start_cm(lr.my_id, lr.my_name, false);
                 // 家庭守卫（WP3）：确认等待超时——超时后仍未授权则按拒绝断连。
                 // 授权成功时 AuthedConnID 已进入 AUTHED_CONNS，超时任务检测到即不再动作；
@@ -4955,8 +4965,13 @@ impl Connection {
             return;
         }
         self.closed = true;
-        // 家庭守卫语义（WP6，无条件执行）：断连第一时间关闭输入闸门——此后输入
-        // 线程丢弃一切已入队键鼠（晚到包拒绝），再走后续关闭流程
+        // 家庭守卫语义（WP6/WP7，无条件执行）：先记审计（授权状态拆除前），
+        // 再关输入闸门——此后输入线程丢弃一切已入队键鼠（晚到包拒绝）
+        crate::family_guard::audit_event(
+            "closed",
+            self.inner.id(),
+            &format!("reason={}|authorized={}", reason, self.authorized),
+        );
         self.input_gate
             .store(false, std::sync::atomic::Ordering::Relaxed);
         self.authorized = false;

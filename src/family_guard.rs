@@ -19,6 +19,7 @@ use hbb_common::{
     config::{keys, Config, BUILTIN_SETTINGS, OVERWRITE_SETTINGS},
     log,
 };
+use std::io::Write as _;
 
 pub const OPTION_FAMILY_GUARD: &str = "family-guard";
 
@@ -29,6 +30,72 @@ const DEFAULT_CONSENT_TIMEOUT_SECS: u64 = 60;
 /// 家庭守卫是否启用（默认启用；本地显式置 "N" 关闭，仅供开发）
 pub fn enabled() -> bool {
     crate::get_local_option(OPTION_FAMILY_GUARD) != "N"
+}
+
+// ---------- 本地脱敏审计（WP7） ----------
+// 任务包 02 数据流约束：只记录 session 标识（脱敏）、端类型、状态、时长、错误码；
+// 禁止凭证（密码/密钥）与输入内容；文件自动截断。
+// 自建 OSS hbbs 无 API server（上游 post_conn_audit 空转），审计落本地文件。
+
+const AUDIT_FILE: &str = "family-audit.log";
+const AUDIT_MAX_BYTES: u64 = 512 * 1024;
+
+fn audit_path() -> Option<std::path::PathBuf> {
+    Some(Config::get_home().join(AUDIT_FILE))
+}
+
+/// 追加一条审计事件（JSON 行）。绝不写入凭证/输入内容——调用方约束见 WP7 文档。
+pub fn audit_event(event: &str, conn_id: i32, detail: &str) {
+    if !enabled() {
+        return;
+    }
+    let Some(path) = audit_path() else {
+        return;
+    };
+    // 简单轮转：超限则截断保留后半，避免审计文件无限增长
+    if let Ok(md) = std::fs::metadata(&path) {
+        if md.len() > AUDIT_MAX_BYTES {
+            match std::fs::read(&path) {
+                Ok(data) => {
+                    let keep = &data[data.len() / 2..];
+                    // 找到下一行边界，避免半行 JSON
+                    let start = keep.iter().position(|&b| b == b'\n').map(|p| p + 1).unwrap_or(0);
+                    if let Err(e) = std::fs::write(&path, &keep[start..]) {
+                        log::warn!("family guard audit rotate failed: {}", e);
+                        return;
+                    }
+                }
+                Err(e) => {
+                    log::warn!("family guard audit read failed: {}", e);
+                    return;
+                }
+            }
+        }
+    }
+    let line = format!(
+        "{{\"ts\":{},\"event\":\"{}\",\"conn_id\":{},\"detail\":\"{}\"}}\n",
+        chrono_like_ts(),
+        event,
+        conn_id,
+        detail.replace('\\', "\\\\").replace('\"', "\\\"")
+    );
+    let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            log::warn!("family guard audit open failed: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = file.write_all(line.as_bytes()) {
+        log::warn!("family guard audit write failed: {}", e);
+    }
+}
+
+fn chrono_like_ts() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// 确认等待超时秒数（默认 60；LocalConfig 可覆盖，非法值回退默认）
