@@ -361,6 +361,10 @@ pub struct Connection {
     audio_sender: Option<MediaSender>,
     // audio by the remote peer/client
     tx_input: std_mpsc::Sender<MessageInput>,
+    // 家庭守卫（WP6）：输入闸门——STOP/断连第一时间关闭，输入线程处理每条消息前
+    // 检查；防止已入队 tx_input 的残留键鼠在断连后仍被注入（旧版注入窗口≈队列
+    // 积压+500ms recv_timeout）。授权时开启。
+    input_gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
     // handle input messages
     video_ack_required: bool,
     server_audit_conn: String,
@@ -492,6 +496,8 @@ impl Connection {
         let (tx, mut rx) = mpsc::unbounded_channel::<(Instant, Arc<Message>)>();
         let (tx_video, mut rx_video) = mpsc::unbounded_channel::<(Instant, Arc<Message>)>();
         let (tx_input, _rx_input) = std_mpsc::channel();
+        // 家庭守卫（WP6）：输入闸门——授权开启、断连/STOP 关闭；输入线程逐条检查
+        let input_gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tx_from_authed, mut rx_from_authed) = mpsc::unbounded_channel::<ipc::Data>();
         let mut hbbs_rx = crate::hbbs_http::sync::signal_receiver();
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -558,6 +564,7 @@ impl Connection {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             show_my_cursor: false,
             tx_input,
+            input_gate: input_gate.clone(),
             video_ack_required: false,
             server_audit_conn: "".to_owned(),
             server_audit_file: "".to_owned(),
@@ -647,6 +654,7 @@ impl Connection {
         let mut test_delay_timer =
             crate::rustdesk_interval(time::interval_at(Instant::now(), TEST_DELAY_TIMEOUT));
         let mut last_recv_time = Instant::now();
+        let input_gate_for_thread = conn.input_gate.clone();
 
         conn.stream.set_send_timeout(
             if conn.file_transfer.is_some() || conn.port_forward_socket.is_some() || conn.terminal {
@@ -657,7 +665,9 @@ impl Connection {
         );
 
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        std::thread::spawn(move || Self::handle_input(_rx_input, tx_cloned));
+        std::thread::spawn(move || {
+            Self::handle_input(_rx_input, tx_cloned, input_gate_for_thread)
+        });
         let mut second_timer = crate::rustdesk_interval(time::interval(Duration::from_secs(1)));
 
         #[cfg(feature = "unix-file-copy-paste")]
@@ -701,6 +711,15 @@ impl Connection {
                             }
                         }
                         ipc::Data::Close => {
+                            // 家庭守卫（WP6）：STOP 先降权关闸（输入线程立即丢弃
+                            // 残留键鼠），再拆连接
+                            conn.input_gate
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
+                            conn.authorized = false;
+                            conn.keyboard = false;
+                            conn.clipboard = false;
+                            conn.file = false;
+                            conn.audio = false;
                             conn.chat_unanswered = false; // seen
                             conn.file_transferred = false; //seen
                             conn.send_close_reason_no_retry("").await;
@@ -1184,7 +1203,12 @@ impl Connection {
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    fn handle_input(receiver: std_mpsc::Receiver<MessageInput>, tx: Sender) {
+    fn handle_input(
+        receiver: std_mpsc::Receiver<MessageInput>,
+        tx: Sender,
+        input_gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::atomic::Ordering;
         let mut block_input_mode = false;
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
@@ -1195,7 +1219,17 @@ impl Connection {
         reset_input_ondisconn();
         loop {
             match receiver.recv_timeout(std::time::Duration::from_millis(500)) {
-                Ok(v) => match v {
+                Ok(v) => {
+                    // 家庭守卫（WP6）：闸门关闭（STOP/断连）后，已入队的残留键鼠
+                    // 直接丢弃——命令拒绝优先于连接拆除
+                    if matches!(
+                        v,
+                        MessageInput::Mouse(..) | MessageInput::Key(..) | MessageInput::Pointer(..)
+                    ) && !input_gate.load(Ordering::Relaxed)
+                    {
+                        continue;
+                    }
+                    match v {
                     MessageInput::Mouse(mouse_input) => {
                         handle_mouse(
                             &mouse_input.msg,
@@ -1270,6 +1304,7 @@ impl Connection {
                             .lock()
                             .unwrap()
                             .send(block_input_mode);
+                    }
                     }
                 },
                 Err(err) => {
@@ -1684,6 +1719,10 @@ impl Connection {
             return false;
         }
         self.authorized = true;
+        // 家庭守卫（WP6）：授权完成——打开输入闸门（初始为关，未授权连接的任何
+        // 已入队输入都不会注入）
+        self.input_gate
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let (conn_type, auth_conn_type) = if self.file_transfer.is_some() {
             (1, AuthConnType::FileTransfer)
         } else if self.port_forward_socket.is_some() {
@@ -4916,6 +4955,11 @@ impl Connection {
             return;
         }
         self.closed = true;
+        // 家庭守卫语义（WP6，无条件执行）：断连第一时间关闭输入闸门——此后输入
+        // 线程丢弃一切已入队键鼠（晚到包拒绝），再走后续关闭流程
+        self.input_gate
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.authorized = false;
         // If voice A,B -> C, and A,B has voice call
         // B disconnects, C will reset the voice call input.
         //
