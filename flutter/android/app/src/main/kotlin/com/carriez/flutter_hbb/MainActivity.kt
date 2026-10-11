@@ -197,6 +197,26 @@ class MainActivity : FlutterActivity() {
                     )
                     result.success(true)
                 }
+                "bring_to_front" -> {
+                    // FamilyAssist: an incoming connection must be visible to the
+                    // elder. If the app was backgrounded (e.g. HOME pressed), the
+                    // in-app consent dialog would never be seen and the request
+                    // would silently auto-reject. Bringing the existing task back
+                    // to the front is permitted because RustDesk holds the
+                    // SYSTEM_ALERT_WINDOW grant (required during onboarding).
+                    try {
+                        Intent(context, MainActivity::class.java).apply {
+                            addFlags(
+                                Intent.FLAG_ACTIVITY_NEW_TASK or
+                                        Intent.FLAG_ACTIVITY_SINGLE_TOP
+                            )
+                        }.also { context.startActivity(it) }
+                        result.success(true)
+                    } catch (e: Exception) {
+                        Log.e(logTag, "bring_to_front failed: ${e.message}")
+                        result.success(false)
+                    }
+                }
                 "stop_input" -> {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                         InputService.ctx?.disableSelf()

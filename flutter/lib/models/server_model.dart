@@ -739,7 +739,13 @@ class ServerModel with ChangeNotifier {
       }
       scrollToBottom();
       notifyListeners();
-      if (isAndroid && !client.authorized) showLoginDialog(client);
+      if (isAndroid && !client.authorized) {
+        // FamilyAssist: the consent dialog lives inside this activity. If the
+        // app was backgrounded (elder pressed HOME), it would never be seen
+        // and the request would silently auto-reject after the timeout.
+        parent.target?.invokeMethod(AndroidChannel.kBringToFront);
+        showLoginDialog(client);
+      }
       if (isAndroid) androidUpdatekeepScreenOn();
     } catch (e) {
       debugPrint("Failed to call loginRequest,error:$e");
