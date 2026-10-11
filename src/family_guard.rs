@@ -72,13 +72,7 @@ pub fn audit_event(event: &str, conn_id: i32, detail: &str) {
             }
         }
     }
-    let line = format!(
-        "{{\"ts\":{},\"event\":\"{}\",\"conn_id\":{},\"detail\":\"{}\"}}\n",
-        chrono_like_ts(),
-        event,
-        conn_id,
-        detail.replace('\\', "\\\\").replace('\"', "\\\"")
-    );
+    let line = audit_line(event, conn_id, detail, chrono_like_ts());
     let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         Ok(f) => f,
         Err(e) => {
@@ -89,6 +83,20 @@ pub fn audit_event(event: &str, conn_id: i32, detail: &str) {
     if let Err(e) = file.write_all(line.as_bytes()) {
         log::warn!("family guard audit write failed: {}", e);
     }
+}
+
+// Use the JSON serializer for both string fields: peer-controlled text and close
+// reasons may contain newlines, quotes or control characters.
+fn audit_line(event: &str, conn_id: i32, detail: &str, timestamp: u64) -> String {
+    let mut line = serde_json::json!({
+        "ts": timestamp,
+        "event": event,
+        "conn_id": conn_id,
+        "detail": detail,
+    })
+    .to_string();
+    line.push('\n');
+    line
 }
 
 fn chrono_like_ts() -> u64 {
@@ -151,4 +159,38 @@ pub fn apply() {
     log::info!(
         "family guard applied: approve-mode=click, permanent-password & trusted-devices disabled"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::audit_line;
+
+    #[test]
+    fn audit_strings_round_trip_without_extra_lines() {
+        for text in [
+            "ordinary text",
+            "设备名称与关闭原因 🛑",
+            "quote\" slash\\ newline\nreturn\rtab\t nul\0",
+            "\n{\"event\":\"authorized\"}\n",
+        ] {
+            let line = audit_line(text, -7, text, 123);
+            assert_eq!(line.bytes().filter(|&b| b == b'\n').count(), 1);
+            assert!(line.ends_with('\n'));
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(value["event"], text);
+            assert_eq!(value["detail"], text);
+            assert_eq!(value["conn_id"], -7);
+            assert_eq!(value["ts"], 123);
+        }
+    }
+
+    #[test]
+    fn audit_escapes_every_ascii_control_character() {
+        let text: String = (0u8..32).map(char::from).collect();
+        let line = audit_line(&text, 0, &text, 0);
+        assert!(line[..line.len() - 1].bytes().all(|b| b >= 32));
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["event"], text);
+        assert_eq!(value["detail"], text);
+    }
 }
