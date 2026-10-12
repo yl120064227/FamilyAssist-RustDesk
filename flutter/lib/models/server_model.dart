@@ -57,6 +57,14 @@ class ServerModel with ChangeNotifier {
   int _serviceOperation = 0;
   int _keepScreenOnGeneration = 0;
 
+  // 家庭守卫（WP5）：用户显式关闭输入控制后，抑制无障碍绑定状态事件的自动回弹。
+  // 系统级 enabled_accessibility_services 仍注册时，InputService 会被系统重新
+  // 绑定并触发 on_state_changed(input=true)——若不抑制，开关在数秒内被拉回 ON
+  //（G1 动态测试 T2 实测）。用户主动开启路径（showInputWarnAlert 确认后返回）
+  // 会清除此抑制，正常开启流程不受影响。
+  DateTime? _suppressAutoInputOnUntil;
+  bool? _familyGuardCache;
+
   final _wakelockKey = UniqueKey();
 
   bool get isStart => _isStart;
@@ -406,10 +414,17 @@ class ServerModel with ChangeNotifier {
     if (_inputOk) {
       parent.target?.invokeMethod("stop_input");
       await bind.mainSetOption(key: kOptionEnableKeyboard, value: 'N');
+      // 家庭守卫（WP5）：记录用户显式关闭时刻——后续 60s 内的 input=true 绑定
+      // 事件视为系统残留回弹并抑制
+      _suppressAutoInputOnUntil = DateTime.now().add(
+        const Duration(seconds: 60),
+      );
     } else {
       if (parent.target != null) {
         /// the result of toggle-on depends on user actions in the settings page.
         /// handle result, see [ServerModel.changeStatue]
+        // 家庭守卫（WP5）：用户主动开启——清除抑制，允许绑定事件生效
+        _suppressAutoInputOnUntil = null;
         showInputWarnAlert(parent.target!);
       }
     }
@@ -606,6 +621,19 @@ class ServerModel with ChangeNotifier {
           }
           break;
         case "input":
+          // 家庭守卫（WP5）：抑制系统级无障碍残留绑定导致的自动回弹——
+          // 用户刚显式关闭输入控制（60s 窗口内）时，input=true 事件被忽略，
+          // 选项与 UI 状态保持关闭（键盘权限 false）。关闭方向（false）不受影响。
+          if (value && _suppressAutoInputOnUntil != null) {
+            if (DateTime.now().isBefore(_suppressAutoInputOnUntil!)) {
+              if (_familyGuardEnabled()) {
+                debugPrint(
+                    "family guard: suppressed auto input-on from a11y rebind");
+                return;
+              }
+            }
+            _suppressAutoInputOnUntil = null;
+          }
           if (_inputOk != value) {
             await bind.mainSetOption(
                 key: kOptionEnableKeyboard,
@@ -621,6 +649,12 @@ class ServerModel with ChangeNotifier {
     } finally {
       if (!_disposed) notifyListeners();
     }
+  }
+
+  bool _familyGuardEnabled() {
+    // 缓存一次：本地选项不参与同步，进程内不会变
+    _familyGuardCache ??= bind.mainGetLocalOption(key: 'family-guard') != 'N';
+    return _familyGuardCache!;
   }
 
   // force
@@ -892,10 +926,11 @@ class ServerModel with ChangeNotifier {
     } catch (error, stackTrace) {
       debugPrint("Failed to close all connections: $error\n$stackTrace");
     } finally {
-      if (_disposed) return;
-      _clients.clear();
-      tabController.state.value.tabs.clear();
-      if (isAndroid) androidUpdatekeepScreenOn();
+      if (!_disposed) {
+        _clients.clear();
+        tabController.state.value.tabs.clear();
+        if (isAndroid) androidUpdatekeepScreenOn();
+      }
     }
   }
 

@@ -2084,10 +2084,12 @@ pub fn load_custom_client() {
     #[cfg(debug_assertions)]
     if let Ok(data) = std::fs::read_to_string("./custom.txt") {
         read_custom_client(data.trim());
+        crate::family_guard::apply();
         return;
     }
     let Some(path) = std::env::current_exe().map_or(None, |x| x.parent().map(|x| x.to_path_buf()))
     else {
+        crate::family_guard::apply();
         return;
     };
     #[cfg(target_os = "macos")]
@@ -2096,10 +2098,12 @@ pub fn load_custom_client() {
     if path.is_file() {
         let Ok(data) = std::fs::read_to_string(&path) else {
             log::error!("Failed to read custom client config");
+            crate::family_guard::apply();
             return;
         };
         read_custom_client(&data.trim());
     }
+    crate::family_guard::apply();
 }
 
 fn read_custom_client_advanced_settings(

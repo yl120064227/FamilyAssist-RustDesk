@@ -1501,7 +1501,7 @@ pub mod connection_manager {
     use super::GLOBAL_EVENT_STREAM;
 
     #[derive(Clone)]
-    struct FlutterHandler {}
+    pub struct FlutterHandler {}
 
     impl InvokeUiCM for FlutterHandler {
         //TODO port_forward

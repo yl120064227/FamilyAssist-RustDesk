@@ -279,7 +279,7 @@ impl<T: InvokeUiCM> ConnectionManager<T> {
             .unwrap_or(false)
     }
 
-    fn remove_connection(&self, id: i32, close: bool) {
+    pub fn remove_connection(&self, id: i32, close: bool) {
         if close {
             CLIENTS.write().unwrap().remove(&id);
         } else {
@@ -312,6 +312,15 @@ impl<T: InvokeUiCM> ConnectionManager<T> {
         }
 
         self.ui_handler.remove_connection(id, close);
+    }
+
+    /// 家庭守卫（WP4）：连接循环退出的 UI 清理——仅清 CLIENTS 并通知 UI 撤弹窗/卡片，
+    /// **不触发 stop_capture**。断开清理若停采集会在拒绝/超时场景（从未真正共享）
+    /// 打断 MediaProjection（触发系统重授权弹窗，卡死服务）——共享启停由用户与服务
+    /// 生命周期管理。
+    pub fn remove_connection_ui_only(&self, id: i32) {
+        CLIENTS.write().unwrap().remove(&id);
+        self.ui_handler.remove_connection(id, true);
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]

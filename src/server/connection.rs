@@ -81,6 +81,8 @@ lazy_static::lazy_static! {
     pub static ref CONTROL_PERMISSIONS_ARRAY: Arc::<Mutex<Vec<(i32, ControlPermissions)>>> = Default::default();
     static ref WAKELOCK_SENDER: Arc::<Mutex<std::sync::mpsc::Sender<(usize, usize)>>> = Arc::new(Mutex::new(start_wakelock_thread()));
     static ref WAKELOCK_KEEP_AWAKE_OPTION: Arc::<Mutex<Option<bool>>> = Default::default();
+    // 家庭守卫：等待本机确认（Click 弹窗挂起中）的连接 id 集合——单 pending 约束
+    static ref PENDING_CONSENT_CONNS: Arc::<Mutex<HashSet<i32>>> = Default::default();
 }
 
 #[cfg(feature = "flutter")]
@@ -92,6 +94,12 @@ lazy_static::lazy_static! {
 
 #[cfg(target_os = "windows")]
 const TERMINAL_OS_LOGIN_FAILED_MSG: &str = "Incorrect username or password.";
+
+/// 家庭守卫：已有控制会话时拒绝新控制连接的提示
+const LOGIN_MSG_ANOTHER_CONTROLLER: &str = "Another session is in control";
+
+/// 家庭守卫：已有确认请求挂起时拒绝新连接的提示（单 pending，防弹窗堆积）
+const LOGIN_MSG_PENDING_CONFIRMATION: &str = "Another confirmation is pending";
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -315,6 +323,11 @@ pub struct Connection {
     port_forward_socket: Option<Framed<TcpStream, BytesCodec>>,
     port_forward_address: String,
     tx_to_cm: mpsc::UnboundedSender<ipc::Data>,
+    // clone of the tx_from_cm channel sender; used by the family-guard consent
+    // timeout task to feed ipc::Data::Close back into this connection's loop
+    tx_cm_event: mpsc::UnboundedSender<ipc::Data>,
+    // 家庭守卫：Click 确认挂起守卫（单 pending 约束）
+    pending_consent_guard: Option<raii::PendingConsentID>,
     authorized: bool,
     require_2fa: Option<totp_rs::TOTP>,
     keyboard: bool,
@@ -348,6 +361,10 @@ pub struct Connection {
     audio_sender: Option<MediaSender>,
     // audio by the remote peer/client
     tx_input: std_mpsc::Sender<MessageInput>,
+    // 家庭守卫（WP6）：输入闸门——STOP/断连第一时间关闭，输入线程处理每条消息前
+    // 检查；防止已入队 tx_input 的残留键鼠在断连后仍被注入（旧版注入窗口≈队列
+    // 积压+500ms recv_timeout）。授权时开启。
+    input_gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
     // handle input messages
     video_ack_required: bool,
     server_audit_conn: String,
@@ -479,6 +496,8 @@ impl Connection {
         let (tx, mut rx) = mpsc::unbounded_channel::<(Instant, Arc<Message>)>();
         let (tx_video, mut rx_video) = mpsc::unbounded_channel::<(Instant, Arc<Message>)>();
         let (tx_input, _rx_input) = std_mpsc::channel();
+        // 家庭守卫（WP6）：输入闸门——授权开启、断连/STOP 关闭；输入线程逐条检查
+        let input_gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tx_from_authed, mut rx_from_authed) = mpsc::unbounded_channel::<ipc::Data>();
         let mut hbbs_rx = crate::hbbs_http::sync::signal_receiver();
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -516,6 +535,8 @@ impl Connection {
             port_forward_socket: None,
             port_forward_address: "".to_owned(),
             tx_to_cm,
+            tx_cm_event: tx_from_cm.clone(),
+            pending_consent_guard: None,
             authorized: false,
             keyboard: Self::permission(keys::OPTION_ENABLE_KEYBOARD, &control_permissions),
             clipboard: Self::permission(keys::OPTION_ENABLE_CLIPBOARD, &control_permissions),
@@ -543,6 +564,7 @@ impl Connection {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             show_my_cursor: false,
             tx_input,
+            input_gate: input_gate.clone(),
             video_ack_required: false,
             server_audit_conn: "".to_owned(),
             server_audit_file: "".to_owned(),
@@ -632,6 +654,7 @@ impl Connection {
         let mut test_delay_timer =
             crate::rustdesk_interval(time::interval_at(Instant::now(), TEST_DELAY_TIMEOUT));
         let mut last_recv_time = Instant::now();
+        let input_gate_for_thread = conn.input_gate.clone();
 
         conn.stream.set_send_timeout(
             if conn.file_transfer.is_some() || conn.port_forward_socket.is_some() || conn.terminal {
@@ -642,7 +665,9 @@ impl Connection {
         );
 
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        std::thread::spawn(move || Self::handle_input(_rx_input, tx_cloned));
+        std::thread::spawn(move || {
+            Self::handle_input(_rx_input, tx_cloned, input_gate_for_thread)
+        });
         let mut second_timer = crate::rustdesk_interval(time::interval(Duration::from_secs(1)));
 
         #[cfg(feature = "unix-file-copy-paste")]
@@ -676,6 +701,14 @@ impl Connection {
                         ipc::Data::Authorize => {
                             conn.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::Click);
                             conn.require_2fa.take();
+                            // 家庭守卫（WP4）：授权完成即释放 pending 槽
+                            conn.pending_consent_guard = None;
+                            // 家庭守卫（WP7）：仅以本地连接 ID 关联事件，不记录对端身份
+                            crate::family_guard::audit_event(
+                                "authorized",
+                                conn.inner.id(),
+                                "",
+                            );
                             if !conn.send_logon_response_and_keep_alive().await {
                                 break;
                             }
@@ -684,6 +717,15 @@ impl Connection {
                             }
                         }
                         ipc::Data::Close => {
+                            // 家庭守卫（WP6）：STOP 先降权关闸（输入线程立即丢弃
+                            // 残留键鼠），再拆连接
+                            conn.input_gate
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
+                            conn.authorized = false;
+                            conn.keyboard = false;
+                            conn.clipboard = false;
+                            conn.file = false;
+                            conn.audio = false;
                             conn.chat_unanswered = false; // seen
                             conn.file_transferred = false; //seen
                             conn.send_close_reason_no_retry("").await;
@@ -1151,11 +1193,28 @@ impl Connection {
             try_stop_record_cursor_pos();
         }
         conn.on_close("End", true).await;
+        // 家庭守卫（WP4）：安卓没有桌面 ipc_task 的退出清理路径（start_listen 收到
+        // Close 直接 break）——连接断开时 CLIENTS/确认弹窗/通知会永久残留。
+        // 在此触发 UI 清理（CLIENTS 移除 + on_client_remove 事件，flutter 侧
+        // dismissByTag 清弹窗）。注意用 ui_only 版本：不带 stop_capture 副作用，
+        // 否则拒绝/超时场景（从未真正共享）会打断 MediaProjection。
+        #[cfg(target_os = "android")]
+        {
+            crate::ui_cm_interface::ConnectionManager {
+                ui_handler: crate::flutter::connection_manager::FlutterHandler {},
+            }
+            .remove_connection_ui_only(id);
+        }
         log::info!("#{} connection loop exited", id);
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    fn handle_input(receiver: std_mpsc::Receiver<MessageInput>, tx: Sender) {
+    fn handle_input(
+        receiver: std_mpsc::Receiver<MessageInput>,
+        tx: Sender,
+        input_gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::atomic::Ordering;
         let mut block_input_mode = false;
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
@@ -1166,7 +1225,17 @@ impl Connection {
         reset_input_ondisconn();
         loop {
             match receiver.recv_timeout(std::time::Duration::from_millis(500)) {
-                Ok(v) => match v {
+                Ok(v) => {
+                    // 家庭守卫（WP6）：闸门关闭（STOP/断连）后，已入队的残留键鼠
+                    // 直接丢弃——命令拒绝优先于连接拆除
+                    if matches!(
+                        v,
+                        MessageInput::Mouse(..) | MessageInput::Key(..) | MessageInput::Pointer(..)
+                    ) && !input_gate.load(Ordering::Relaxed)
+                    {
+                        continue;
+                    }
+                    match v {
                     MessageInput::Mouse(mouse_input) => {
                         handle_mouse(
                             &mouse_input.msg,
@@ -1241,6 +1310,7 @@ impl Connection {
                             .lock()
                             .unwrap()
                             .send(block_input_mode);
+                    }
                     }
                 },
                 Err(err) => {
@@ -1655,6 +1725,10 @@ impl Connection {
             return false;
         }
         self.authorized = true;
+        // 家庭守卫（WP6）：授权完成——打开输入闸门（初始为关，未授权连接的任何
+        // 已入队输入都不会注入）
+        self.input_gate
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let (conn_type, auth_conn_type) = if self.file_transfer.is_some() {
             (1, AuthConnType::FileTransfer)
         } else if self.port_forward_socket.is_some() {
@@ -2355,6 +2429,23 @@ impl Connection {
                 && (tfa && session.tfa
                     || !tfa && self.validate_password_plain(&session.random_password))
             {
+                if crate::family_guard::enabled() {
+                    // 家庭守卫：仅豁免伴生连接（同一会话仍有活跃授权连接，如会话内
+                    // 打开文件标签复用 session token 的 FileTransfer）。
+                    // 断线重连时原连接已从 AUTHED_CONNS 移除——必须重新经本机确认。
+                    let key = self.session_key();
+                    let has_active_conn = AUTHED_CONNS
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|c| c.session_key == key);
+                    if !has_active_conn {
+                        log::info!(
+                            "family guard: session resumption denied, on-device re-consent required"
+                        );
+                        return false;
+                    }
+                }
                 if tfa {
                     self.set_conn_audit_two_factor(ConnAuditTwoFactor::Totp);
                 } else {
@@ -2372,7 +2463,12 @@ impl Connection {
         #[cfg(feature = "flutter")]
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
-            let access_mode = Config::get_option("access-mode");
+            let access_mode = if crate::family_guard::enabled() {
+                // 家庭守卫：access-mode=full 是一键放权旁路面，视同未设置
+                String::new()
+            } else {
+                Config::get_option("access-mode")
+            };
             if access_mode == "full" {
                 return true;
             } else if access_mode == "view" {
@@ -2432,6 +2528,10 @@ impl Connection {
 
     #[inline]
     fn enable_trusted_devices() -> bool {
+        if crate::family_guard::enabled() {
+            // 家庭守卫：信任设备是 2FA 旁路面，一律禁用
+            return false;
+        }
         config::option2bool(
             keys::OPTION_ENABLE_TRUSTED_DEVICES,
             &Config::get_option(keys::OPTION_ENABLE_TRUSTED_DEVICES),
@@ -2594,6 +2694,29 @@ impl Connection {
                 return false;
             }
 
+            // 家庭守卫：单控制者——已存在活跃 Remote 授权连接时拒绝新的控制连接
+            //（伴生连接除外：同 session_key 复用会话 token 的 FileTransfer 等，
+            //  由 is_recent_session 的家庭分支放行）。拒绝发生在弹确认框之前，
+            //  不打扰被控端长辈。
+            if crate::family_guard::enabled() {
+                let key = self.session_key();
+                let (has_remote, is_companion) = {
+                    let conns = AUTHED_CONNS.lock().unwrap();
+                    (
+                        conns.iter().any(|c| c.conn_type == AuthConnType::Remote),
+                        conns.iter().any(|c| c.session_key == key),
+                    )
+                };
+                if has_remote && !is_companion {
+                    log::info!(
+                        "family guard: rejected additional controller while a session is active"
+                    );
+                    self.send_login_error(LOGIN_MSG_ANOTHER_CONTROLLER).await;
+                    sleep(1.).await;
+                    return false;
+                }
+            }
+
             #[cfg(target_os = "windows")]
             if self.terminal
                 && lr.os_login.username.trim().is_empty()
@@ -2669,12 +2792,19 @@ impl Connection {
             #[cfg(any(target_os = "android", target_os = "ios"))]
             let is_logon = || crate::platform::is_prelogin();
 
-            let allow_logon_screen_password =
-                crate::get_builtin_option(keys::OPTION_ALLOW_LOGON_SCREEN_PASSWORD) == "Y"
+            let allow_logon_screen_password = !crate::family_guard::enabled()
+                && crate::get_builtin_option(keys::OPTION_ALLOW_LOGON_SCREEN_PASSWORD) == "Y"
                     && is_logon();
 
-            if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)
-                || password::approve_mode() == ApproveMode::Both && !password::has_valid_password()
+            // 家庭守卫：强制 Click 模式——密码（含一次性密码）不构成免确认直入
+            let approve_mode = if crate::family_guard::enabled() {
+                ApproveMode::Click
+            } else {
+                password::approve_mode()
+            };
+
+            if (approve_mode == ApproveMode::Click && !allow_logon_screen_password)
+                || approve_mode == ApproveMode::Both && !password::has_valid_password()
             {
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 if should_use_terminal_os_login_scope(self.terminal, &lr.os_login.username) {
@@ -2683,7 +2813,55 @@ impl Connection {
                         return keep_alive;
                     }
                 }
+                // 家庭守卫（WP4）：单 pending——已有确认请求挂起时拒绝新连接，
+                // 从根上杜绝确认弹窗堆积（同 peer 或不同 peer 均适用）。
+                if crate::family_guard::enabled() {
+                    let pending_exists = {
+                        let mut pend = PENDING_CONSENT_CONNS.lock().unwrap();
+                        if pend.is_empty() {
+                            pend.insert(self.inner.id());
+                            false
+                        } else {
+                            true
+                        }
+                    };
+                    if pending_exists {
+                        log::info!(
+                            "family guard: rejected connection while another confirmation is pending"
+                        );
+                        self.send_login_error(LOGIN_MSG_PENDING_CONFIRMATION).await;
+                        sleep(1.).await;
+                        return false;
+                    }
+                    self.pending_consent_guard = Some(raii::PendingConsentID::new(self.inner.id()));
+                }
+                // 家庭守卫（WP7）：以本地连接 ID 关联确认与授权，不记录设备名称/对端 ID
+                crate::family_guard::audit_event("consent_asked", self.inner.id(), "");
                 self.try_start_cm(lr.my_id, lr.my_name, false);
+                // 家庭守卫（WP3）：确认等待超时——超时后仍未授权则按拒绝断连。
+                // 授权成功时 AuthedConnID 已进入 AUTHED_CONNS，超时任务检测到即不再动作；
+                // 用户提前 Dismiss 后连接已退出循环，向已关闭通道发送 Close 返回错误被忽略。
+                if crate::family_guard::enabled() {
+                    let conn_id = self.inner.id();
+                    let tx = self.tx_cm_event.clone();
+                    let timeout =
+                        std::time::Duration::from_secs(crate::family_guard::consent_timeout_secs());
+                    tokio::spawn(async move {
+                        tokio::time::sleep(timeout).await;
+                        let authed = AUTHED_CONNS
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|c| c.conn_id == conn_id);
+                        if !authed {
+                            log::info!(
+                                "family guard: consent timeout after {:?}, closing pending connection",
+                                timeout
+                            );
+                            let _ = tx.send(ipc::Data::Close);
+                        }
+                    });
+                }
                 if hbb_common::get_version_number(&lr.version)
                     >= hbb_common::get_version_number("1.2.0")
                 {
@@ -4785,6 +4963,16 @@ impl Connection {
             return;
         }
         self.closed = true;
+        // 家庭守卫（WP6）：先关输入闸门、降权，避免磁盘审计延迟停止输入。
+        self.input_gate
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let was_authorized = self.authorized;
+        self.authorized = false;
+        crate::family_guard::audit_event(
+            "closed",
+            self.inner.id(),
+            &format!("reason={}|authorized={}", reason, was_authorized),
+        );
         // If voice A,B -> C, and A,B has voice call
         // B disconnects, C will reset the voice call input.
         //
@@ -6461,6 +6649,26 @@ mod raii {
     }
 
     pub struct AuthedConnID(i32, AuthConnType);
+
+    /// 家庭守卫：Click 确认挂起状态的 RAII 守卫——连接结束（任何路径）自动从
+    /// PENDING_CONSENT_CONNS 移除；授权成功时由 Authorize 处理主动释放
+    pub struct PendingConsentID(i32);
+
+    impl PendingConsentID {
+        pub fn new(id: i32) -> Self {
+            PENDING_CONSENT_CONNS.lock().unwrap().insert(id);
+            Self(id)
+        }
+    }
+
+    impl Drop for PendingConsentID {
+        fn drop(&mut self) {
+            PENDING_CONSENT_CONNS
+                .lock()
+                .unwrap()
+                .retain(|&c| c != self.0);
+        }
+    }
 
     impl AuthedConnID {
         pub fn new(
