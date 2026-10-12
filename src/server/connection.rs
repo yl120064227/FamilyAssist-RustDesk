@@ -2846,21 +2846,7 @@ impl Connection {
                     let tx = self.tx_cm_event.clone();
                     let timeout =
                         std::time::Duration::from_secs(crate::family_guard::consent_timeout_secs());
-                    tokio::spawn(async move {
-                        tokio::time::sleep(timeout).await;
-                        let authed = AUTHED_CONNS
-                            .lock()
-                            .unwrap()
-                            .iter()
-                            .any(|c| c.conn_id == conn_id);
-                        if !authed {
-                            log::info!(
-                                "family guard: consent timeout after {:?}, closing pending connection",
-                                timeout
-                            );
-                            let _ = tx.send(ipc::Data::Close);
-                        }
-                    });
+                    spawn_consent_timeout(conn_id, tx, timeout);
                 }
                 if hbb_common::get_version_number(&lr.version)
                     >= hbb_common::get_version_number("1.2.0")
@@ -6882,10 +6868,95 @@ mod raii {
     }
 }
 
+/// 家庭守卫（WP3）：确认等待超时任务。抽为自由函数便于竞态测试直接驱动真实实现。
+///
+/// P3 竞态修复：关闭条件从"未注册 AUTHED_CONNS"收紧为"仍处于 pending 等待"。
+/// Authorize 处理先释放 pending、再异步注册 AUTHED_CONNS——空档内醒来的旧
+/// 超时任务按旧条件会误关刚被接受的连接（复现见
+/// test::consent_timeout_must_not_close_connection_in_authorize_gap）。
+/// 只关仍 pending 的连接语义等价：受理（释放 pending）= 已脱离等待，超时不再适用。
+fn spawn_consent_timeout(
+    conn_id: i32,
+    tx: mpsc::UnboundedSender<ipc::Data>,
+    timeout: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(timeout).await;
+        let still_pending = PENDING_CONSENT_CONNS
+            .lock()
+            .unwrap()
+            .contains(&conn_id);
+        let authed = AUTHED_CONNS
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.conn_id == conn_id);
+        if still_pending && !authed {
+            log::info!(
+                "family guard: consent timeout after {:?}, closing pending connection",
+                timeout
+            );
+            let _ = tx.send(ipc::Data::Close);
+        }
+    });
+}
+
 #[cfg(test)]
 mod test {
     #[allow(unused)]
     use super::*;
+
+    /// P3 竞态（计划包 02）：用户在超时临界点点击授权——Authorize 先释放
+    /// pending、再异步注册 AUTHED_CONNS，空档内醒来的 TTL 任务不得向该连接
+    /// 发 Close。现状逻辑只查 AUTHED_CONNS，本测试在真实 spawn_consent_timeout
+    /// 上复现该竞态（修复后必须保持通过）。
+    #[test]
+    fn consent_timeout_must_not_close_connection_in_authorize_gap() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let conn_id = 43210987; // 测试专用 id，不与真实连接冲突
+            let _pending = raii::PendingConsentID::new(conn_id);
+            let (tx, mut rx) = mpsc::unbounded_channel::<ipc::Data>();
+            super::spawn_consent_timeout(conn_id, tx, std::time::Duration::from_millis(150));
+            // 序列：TTL 定时 150ms。t=60ms 授权受理（释放 pending），
+            // t≈150ms TTL 醒来检查——此刻 AUTHED_CONNS 尚未注册（真实流程中
+            // send_logon_response 的网络发送耗时正落在此窗口）。
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            drop(_pending); // Authorize 第一步（ipc::Data::Authorize 处理）
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await; // 让 TTL 完成检查
+            // 尚未注册 AUTHED_CONNS——授权流程仍在途
+            let stale_close = rx.try_recv().ok();
+            assert!(
+                !matches!(stale_close, Some(ipc::Data::Close)),
+                "TTL task closed a connection whose authorization was already accepted \
+                 (pending released at t=60ms, AUTHED_CONNS registration still in flight)"
+            );
+        });
+    }
+
+    /// 反例：从未授权也从未受理的 pending 连接，超时必须被关闭（防过度修复）。
+    #[test]
+    fn consent_timeout_still_closes_never_authorized_connection() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let conn_id = 43210988;
+            let _pending = raii::PendingConsentID::new(conn_id);
+            let (tx, mut rx) = mpsc::unbounded_channel::<ipc::Data>();
+            super::spawn_consent_timeout(conn_id, tx, std::time::Duration::from_millis(80));
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert!(
+                matches!(rx.try_recv().ok(), Some(ipc::Data::Close)),
+                "never-authorized pending connection must be closed on timeout"
+            );
+            // PendingConsentID drop 负责清理 PENDING_CONSENT_CONNS
+        });
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

@@ -52,9 +52,43 @@ pub fn audit_event(event: &str, conn_id: i32, detail: &str) {
     let Some(path) = audit_path() else {
         return;
     };
+    audit_append_at(&path, event, conn_id, detail, chrono_like_ts());
+}
+
+/// 指定路径的轮转+追加（真实生产路径；抽参便于并发测试直接驱动本实现）。
+pub(crate) fn audit_append_at(
+    path: &std::path::Path,
+    event: &str,
+    conn_id: i32,
+    detail: &str,
+    timestamp: u64,
+) {
+    audit_append_with_limit(path, event, conn_id, detail, timestamp, AUDIT_MAX_BYTES);
+}
+
+/// 轮转与追加的当前实现。轮转策略：超限则截断保留后半（行对齐），旧事件按策略淘汰。
+///
+/// 并发正确性（P2 修复）：轮转（读全文件+写半）与追加必须在同一临界区内串行，
+/// 否则并发轮转会互相截断——复现见 tests::audit_concurrent_rotation_must_not_lose_new_events
+/// （未加锁基线丢失 752/800 新事件）。进程内互斥；当前产品单进程写此文件，
+/// 跨进程审计共享同一路径不在本修复范围（如未来多进程需文件锁或独立文件）。
+static AUDIT_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) fn audit_append_with_limit(
+    path: &std::path::Path,
+    event: &str,
+    conn_id: i32,
+    detail: &str,
+    timestamp: u64,
+    max_bytes: u64,
+) {
+    // 锁中毒=持有者 panic 释放后恢复，审计不因中毒永久停写
+    let _guard = AUDIT_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // 简单轮转：超限则截断保留后半，避免审计文件无限增长
     if let Ok(md) = std::fs::metadata(&path) {
-        if md.len() > AUDIT_MAX_BYTES {
+        if md.len() > max_bytes {
             match std::fs::read(&path) {
                 Ok(data) => {
                     let keep = &data[data.len() / 2..];
@@ -72,7 +106,7 @@ pub fn audit_event(event: &str, conn_id: i32, detail: &str) {
             }
         }
     }
-    let line = audit_line(event, conn_id, detail, chrono_like_ts());
+    let line = audit_line(event, conn_id, detail, timestamp);
     let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         Ok(f) => f,
         Err(e) => {
@@ -163,7 +197,149 @@ pub fn apply() {
 
 #[cfg(test)]
 mod tests {
-    use super::audit_line;
+    use super::{audit_append_with_limit, audit_line};
+    use std::io::Write as _;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Barrier};
+
+    fn temp_audit_path(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir()
+            .join(format!(
+                "fa_audit_test_{}_{}_{}",
+                tag,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos()
+            ));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// 并发写入时轮转不得丢失"新事件"（P1 复现目标，P2 修复后必须保持通过）。
+    /// 旧事件按轮转策略淘汰是合法的；本测试只断言启动后写入的新事件恰好保留一次。
+    #[test]
+    fn audit_concurrent_rotation_must_not_lose_new_events() {
+        let path = temp_audit_path("race");
+        // 预填至接近限额，首次追加即触发轮转；4KiB 小限额让轮转高频出现
+        let limit: u64 = 4 * 1024;
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            let filler = format!("{{\"filler\":\"{}\"}}\n", "x".repeat(60));
+            let mut written = 0u64;
+            while written + filler.len() as u64 <= limit - 100 {
+                f.write_all(filler.as_bytes()).unwrap();
+                written += filler.len() as u64;
+            }
+        }
+        const WRITERS: usize = 4;
+        const EVENTS_PER_WRITER: usize = 400;
+        let barrier = Arc::new(Barrier::new(WRITERS));
+        let path = Arc::new(path);
+        let violations = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let mut handles = Vec::new();
+        for w in 0..WRITERS {
+            let barrier = barrier.clone();
+            let path = path.clone();
+            let violations = violations.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for seq in 0..EVENTS_PER_WRITER {
+                    let detail = format!("NEW-w{}-seq{}", w, seq);
+                    audit_append_with_limit(&*path, "probe", w as i32, &detail, 1, limit);
+                    // 追加后立即自查：本条事件在文件尾部，任何后续合法轮转保留的
+                    // 都是后半区（含尾部）——加锁实现下它不可能消失；若消失，
+                    // 只能是并发轮转用陈旧半区覆写了刚落盘的追加（竞态铁证）。
+                    let snapshot = std::fs::read_to_string(&*path).unwrap_or_default();
+                    if !snapshot.contains(&detail) {
+                        violations.lock().unwrap().push(detail);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // 附加结构校验：全行合法 JSON、每写者文件内序号单调、无重复
+        let data = std::fs::read_to_string(&*path).unwrap();
+        let mut per_writer: Vec<Vec<usize>> = vec![Vec::new(); WRITERS];
+        for line in data.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("corrupted line after rotation: {:?} ({})", line, e));
+            if let Some(d) = v["detail"].as_str() {
+                if let Some(rest) = d.strip_prefix("NEW-w") {
+                    let mut it = rest.splitn(2, "-seq");
+                    if let (Some(w), Some(s)) = (it.next(), it.next()) {
+                        if let (Ok(w), Ok(s)) = (w.parse::<usize>(), s.parse::<usize>()) {
+                            per_writer[w].push(s);
+                        }
+                    }
+                }
+            }
+        }
+        for w in 0..WRITERS {
+            let seqs = &per_writer[w];
+            let dup = seqs.len()
+                != seqs
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len();
+            assert!(!dup, "writer {} has duplicated events", w);
+            let non_mono = seqs.windows(2).any(|p| p[1] <= p[0]);
+            assert!(
+                !non_mono,
+                "writer {} file-order seqs not monotonic — stale rotation resurrected old bytes",
+                w
+            );
+        }
+        let v = violations.lock().unwrap();
+        assert!(
+            v.is_empty(),
+            "{} freshly-appended events vanished under concurrent rotation \
+             (stale-half overwrite), e.g.: {:?}",
+            v.len(),
+            &v[..v.len().min(8)]
+        );
+        let final_size = std::fs::metadata(&*path).unwrap().len();
+        assert!(
+            final_size > limit / 2,
+            "final file under-filled ({}/{} B)",
+            final_size,
+            limit
+        );
+        let _ = std::fs::remove_file(&*path);
+    }
+
+    #[test]
+    fn audit_rotation_keeps_line_boundaries_only() {
+        let path = temp_audit_path("boundary");
+        let filler = format!("{{\"f\":\"{}\"}}\n", "y".repeat(80));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            for _ in 0..((4 * 1024) / filler.len() + 4) {
+                f.write_all(filler.as_bytes()).unwrap();
+            }
+        }
+        audit_append_with_limit(&path, "after_rotate", 9, "tail-event", 42, 4 * 1024);
+        let data = std::fs::read_to_string(&path).unwrap();
+        for line in data.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let v: serde_json::Value =
+                serde_json::from_str(line).expect("every retained line must be complete JSON");
+            if v["detail"] == "tail-event" {
+                assert_eq!(v["event"], "after_rotate");
+                assert_eq!(v["ts"], 42);
+            }
+        }
+        assert!(data.contains("tail-event"), "post-rotation append must exist");
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn audit_strings_round_trip_without_extra_lines() {
